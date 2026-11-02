@@ -1,9 +1,10 @@
 import * as THREE from 'three';
 import {
-  W, D, H, N, CX, CY, CZ, M,
-  grid, burn, idx, inBounds, cellX, cellY, cellZ,
-  setVoxel, addBurn, markDirty, dirtyChunks, voxelColor,
-  MeshBuilder, buildChunkGeometry, generateWorld,
+  H, CS, M,
+  get, getBurn, set as setVoxel, addBurn, isLoaded, cellKey, colKey,
+  dirtyUrgent, dirtyLoad, decodeSection, voxelColor, biomeAt,
+  MeshBuilder, buildSectionGeometry, loadColumn, unloadColumn, getColumn,
+  resetWorld as resetWorldData, spawnPoint,
 } from './world.js';
 
 const GRAVITY = 28;
@@ -29,7 +30,8 @@ document.getElementById('app').appendChild(renderer.domElement);
 const SKY = new THREE.Color(0x9cc4ea);
 const scene = new THREE.Scene();
 scene.background = SKY.clone();
-scene.fog = new THREE.Fog(SKY.clone(), 90, 230);
+const VIEW_CHUNKS = 9; // render distance in chunks
+scene.fog = new THREE.Fog(SKY.clone(), VIEW_CHUNKS * CS * 0.45, VIEW_CHUNKS * CS * 0.95);
 
 const FOV = 75;
 const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.05, 500);
@@ -46,11 +48,10 @@ vmScene.add(vmSun);
 
 scene.add(new THREE.HemisphereLight(0xcfe3ff, 0x5a4a3a, 1.05));
 const sun = new THREE.DirectionalLight(0xfff1dc, 2.3);
-sun.position.set(W / 2 + 70, 140, D / 2 + 45);
-sun.target.position.set(W / 2, 0, D / 2);
+const SUN_OFFSET = new THREE.Vector3(70, 140, 45);
 sun.castShadow = true;
 sun.shadow.mapSize.set(4096, 4096);
-Object.assign(sun.shadow.camera, { left: -100, right: 100, top: 100, bottom: -100, near: 10, far: 330 });
+Object.assign(sun.shadow.camera, { left: -90, right: 90, top: 90, bottom: -90, near: 10, far: 330 });
 sun.shadow.bias = -0.0004;
 sun.shadow.normalBias = 0.04;
 scene.add(sun, sun.target);
@@ -60,23 +61,19 @@ scene.add(blastLight);
 const laserLight = new THREE.PointLight(0xff3020, 0, 12, 2);
 scene.add(laserLight);
 
-const outerGround = new THREE.Mesh(new THREE.PlaneGeometry(1200, 1200), new THREE.MeshLambertMaterial({ color: 0x4f6e3c }));
-outerGround.rotation.x = -Math.PI / 2;
-outerGround.position.set(W / 2, 0.98, D / 2);
-outerGround.receiveShadow = true;
-scene.add(outerGround);
 
 // ============================================================================
-// Chunk meshes
+// Chunk streaming & section meshes
 // ============================================================================
 const chunkMat = new THREE.MeshLambertMaterial({ vertexColors: true });
-const chunkMeshes = new Array(CX * CY * CZ).fill(null);
+const sectionMeshes = new Map();
+const activeColumns = new Set();
 
-function rebuildChunk(ci) {
-  const geo = buildChunkGeometry(ci);
-  let mesh = chunkMeshes[ci];
+function rebuildSection(key) {
+  const geo = buildSectionGeometry(key);
+  let mesh = sectionMeshes.get(key);
   if (!geo) {
-    if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); chunkMeshes[ci] = null; }
+    if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); sectionMeshes.delete(key); }
     return;
   }
   if (mesh) {
@@ -85,21 +82,55 @@ function rebuildChunk(ci) {
   } else {
     mesh = new THREE.Mesh(geo, chunkMat);
     mesh.castShadow = mesh.receiveShadow = true;
-    chunkMeshes[ci] = mesh;
+    sectionMeshes.set(key, mesh);
     scene.add(mesh);
   }
 }
 
-function flushChunks() {
-  for (const ci of dirtyChunks) rebuildChunk(ci);
-  dirtyChunks.clear();
+const sectionColumnKey = (key) => { const { cx, cz } = decodeSection(key); return colKey(cx, cz); };
+
+function flushSections(loadBudget) {
+  for (const key of dirtyUrgent) if (activeColumns.has(sectionColumnKey(key))) rebuildSection(key);
+  dirtyUrgent.clear();
+  for (const key of dirtyLoad) {
+    if (loadBudget-- <= 0) break;
+    dirtyLoad.delete(key);
+    if (activeColumns.has(sectionColumnKey(key))) rebuildSection(key);
+  }
 }
 
-let voxelTotal = 0;
-function countVoxels() {
-  let n = 0;
-  for (let k = 0; k < N; k++) if (grid[k]) n++;
-  return n;
+// Load columns around the player (nearest first) and drop the far ones
+function streamChunks(genBudget) {
+  const pcx = Math.floor(player.pos.x / CS), pcz = Math.floor(player.pos.z / CS);
+  const R = VIEW_CHUNKS;
+  const wanted = [];
+  for (let dz = -R; dz <= R; dz++)
+    for (let dx = -R; dx <= R; dx++) {
+      const d2 = dx * dx + dz * dz;
+      if (d2 > R * R) continue;
+      const cx = pcx + dx, cz = pcz + dz;
+      if (!activeColumns.has(colKey(cx, cz))) wanted.push([d2, cx, cz]);
+    }
+  wanted.sort((a, b) => a[0] - b[0]);
+  for (const [d2, cx, cz] of wanted) {
+    if (genBudget-- <= 0 && d2 > 4) break;
+    loadColumn(cx, cz);
+    activeColumns.add(colKey(cx, cz));
+  }
+  const drop = (R + 2) * (R + 2);
+  for (const key of activeColumns) {
+    const cx = Math.floor(key / 65536) - 32768, cz = (key % 65536) - 32768;
+    const dx = cx - pcx, dz = cz - pcz;
+    if (dx * dx + dz * dz <= drop) continue;
+    activeColumns.delete(key);
+    for (let cy = 0; cy < H / CS; cy++) {
+      const sk = key * (H / CS) + cy;
+      const mesh = sectionMeshes.get(sk);
+      if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); sectionMeshes.delete(sk); }
+    }
+    unloadColumn(cx, cz);
+  }
+  return wanted.length;
 }
 
 // ============================================================================
@@ -252,16 +283,10 @@ function updateDebris(dt) {
     d.rx += d.sx * dt; d.ry += d.sy * dt; d.rz += d.sz * dt;
     if (pulled) continue;
 
-    const gx = Math.floor(d.x), gz = Math.floor(d.z);
-    const inside = gx >= 0 && gx < W && gz >= 0 && gz < D;
-    let floor = inside ? -Infinity : 1;
-    if (inside) {
-      const gy = Math.floor(d.y - 0.44);
-      if (gy >= 0 && gy < H) {
-        const m = grid[idx(gx, gy, gz)];
-        if (m && m !== M.WATER) floor = gy + 1;
-      }
-    }
+    let floor = -Infinity;
+    const gy = Math.floor(d.y - 0.44);
+    const m = get(Math.floor(d.x), gy, Math.floor(d.z));
+    if (m && m !== M.WATER) floor = gy + 1;
     if (d.y - 0.44 < floor && d.vy < 0) {
       d.y = floor + 0.44;
       d.vy = Math.abs(d.vy) > 2 ? -d.vy * 0.3 : 0;
@@ -418,19 +443,20 @@ function addShake(pos, amount, range) {
 // ============================================================================
 const stats = { destroyed: 0 };
 const destroyedEl = document.getElementById('destroyed');
-const remainingEl = document.getElementById('remaining');
+const biomeEl = document.getElementById('biome');
+const coordsEl = document.getElementById('coords');
 let statsDirty = true;
 function updateStats() {
   destroyedEl.textContent = stats.destroyed.toLocaleString();
-  remainingEl.textContent = voxelTotal.toLocaleString();
+
 }
 
-function removeCell(k) {
-  if (!grid[k]) return;
-  grid[k] = 0;
-  burn[k] = 0;
-  markDirty(cellX(k), cellY(k), cellZ(k));
-  voxelTotal--;
+// Removed cells are remembered so the collapse check only looks near the damage
+let touched = [];
+function removeCell(x, y, z) {
+  if (!get(x, y, z)) return;
+  setVoxel(x, y, z, 0);
+  touched.push(x, y, z);
   stats.destroyed++;
   statsDirty = true;
 }
@@ -445,16 +471,15 @@ let collapsePending = false;
 function explode(center, radius, opts = {}) {
   const { force = 10, debrisChance = 0.5, chance, scorch, scorchStrength = 0.6, char = false } = opts;
   const cx = center.x, cy = center.y, cz = center.z;
-  const x0 = Math.max(0, Math.floor(cx - radius)), x1 = Math.min(W - 1, Math.ceil(cx + radius));
+  const x0 = Math.floor(cx - radius), x1 = Math.ceil(cx + radius);
   const y0 = Math.max(0, Math.floor(cy - radius)), y1 = Math.min(H - 1, Math.ceil(cy + radius));
-  const z0 = Math.max(0, Math.floor(cz - radius)), z1 = Math.min(D - 1, Math.ceil(cz + radius));
+  const z0 = Math.floor(cz - radius), z1 = Math.ceil(cz + radius);
   let removed = 0;
 
   for (let y = y0; y <= y1; y++) {
     for (let z = z0; z <= z1; z++) {
       for (let x = x0; x <= x1; x++) {
-        const k = idx(x, y, z);
-        const mat = grid[k];
+        const mat = get(x, y, z);
         if (!mat || mat === M.BEDROCK) continue;
         const dx = x + 0.5 - cx, dy = y + 0.5 - cy, dz = z + 0.5 - cz;
         const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
@@ -462,8 +487,8 @@ function explode(center, radius, opts = {}) {
         if (chance !== undefined && dist > 0.8 && Math.random() > chance) continue;
 
         if (mat === M.TNT) tntQueue.push({ x: x + 0.5, y: y + 0.5, z: z + 0.5, t: rand(0.12, 0.4) });
-        const wasBurn = burn[k];
-        removeCell(k);
+        const wasBurn = getBurn(x, y, z);
+        removeCell(x, y, z);
         removed++;
         if (mat === M.WATER) continue;
 
@@ -486,19 +511,17 @@ function explode(center, radius, opts = {}) {
 }
 
 function scorchArea(cx, cy, cz, R, strength) {
-  const x0 = Math.max(0, Math.floor(cx - R)), x1 = Math.min(W - 1, Math.ceil(cx + R));
+  const x0 = Math.floor(cx - R), x1 = Math.ceil(cx + R);
   const y0 = Math.max(0, Math.floor(cy - R)), y1 = Math.min(H - 1, Math.ceil(cy + R));
-  const z0 = Math.max(0, Math.floor(cz - R)), z1 = Math.min(D - 1, Math.ceil(cz + R));
+  const z0 = Math.floor(cz - R), z1 = Math.ceil(cz + R);
   for (let y = y0; y <= y1; y++)
     for (let z = z0; z <= z1; z++)
       for (let x = x0; x <= x1; x++) {
-        const k = idx(x, y, z);
-        const m = grid[k];
+        const m = get(x, y, z);
         if (!m || m === M.WATER) continue;
         const dist = Math.hypot(x + 0.5 - cx, y + 0.5 - cy, z + 0.5 - cz);
         if (dist > R) continue;
-        addBurn(k, Math.round(255 * strength * (1 - dist / R) * rand(0.85, 1)));
-        markDirty(x, y, z);
+        addBurn(x, y, z, Math.round(255 * strength * (1 - dist / R) * rand(0.85, 1)));
       }
 }
 
@@ -539,54 +562,69 @@ function processTNT(dt) {
 // ============================================================================
 // Structural collapse: unsupported pieces fall as rigid bodies
 // ============================================================================
-const visited = new Uint8Array(N);
-const queue = new Int32Array(N);
-const LAYER = W * D;
 const bodies = [];
 const bodyBuilder = new MeshBuilder();
 let collapseTimer = 0;
+const FLOOD_LIMIT = 40000;
+const NEIGHBORS = [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]];
 
-function floodFrom(head, tail, mark) {
-  while (head < tail) {
-    const k = queue[head++];
-    const x = k % W, z = ((k / W) | 0) % D, y = (k / LAYER) | 0;
-    if (x > 0)     { const n = k - 1;     if (grid[n] && !visited[n]) { visited[n] = mark; queue[tail++] = n; } }
-    if (x < W - 1) { const n = k + 1;     if (grid[n] && !visited[n]) { visited[n] = mark; queue[tail++] = n; } }
-    if (z > 0)     { const n = k - W;     if (grid[n] && !visited[n]) { visited[n] = mark; queue[tail++] = n; } }
-    if (z < D - 1) { const n = k + W;     if (grid[n] && !visited[n]) { visited[n] = mark; queue[tail++] = n; } }
-    if (y > 0)     { const n = k - LAYER; if (grid[n] && !visited[n]) { visited[n] = mark; queue[tail++] = n; } }
-    if (y < H - 1) { const n = k + LAYER; if (grid[n] && !visited[n]) { visited[n] = mark; queue[tail++] = n; } }
+// Starting next to recently removed cells, flood-fill each solid piece. Pieces that
+// reach bedrock, unloaded terrain or grow huge are supported; the rest fall.
+function runCollapse() {
+  const seeds = touched;
+  touched = [];
+  const supported = new Set();
+  const checked = new Set();
+  for (let i = 0; i < seeds.length; i += 3) {
+    for (const [dx, dy, dz] of NEIGHBORS) {
+      const x = seeds[i] + dx, y = seeds[i + 1] + dy, z = seeds[i + 2] + dz;
+      if (y <= 0 || !get(x, y, z)) continue;
+      const k = cellKey(x, y, z);
+      if (checked.has(k) || supported.has(k)) continue;
+      const piece = flood(x, y, z, supported);
+      for (const c of piece.keys) checked.add(c);
+      if (piece.supported) for (const c of piece.keys) supported.add(c);
+      else detachComponent(piece.cells);
+    }
   }
-  return tail;
 }
 
-function runCollapse() {
-  visited.fill(0);
-  let tail = 0;
-  for (let k = 0; k < LAYER; k++) if (grid[k]) { visited[k] = 1; queue[tail++] = k; }
-  floodFrom(0, tail, 1);
-
-  for (let k = LAYER; k < N; k++) {
-    if (!grid[k] || visited[k]) continue;
-    visited[k] = 2;
-    queue[0] = k;
-    const end = floodFrom(0, 1, 2);
-    detachComponent(queue.slice(0, end));
+function flood(sx, sy, sz, supported) {
+  // Depth-first with "down" explored first, so grounded pieces finish fast
+  const stack = [sx, sy, sz];
+  const seen = new Set([cellKey(sx, sy, sz)]);
+  const cells = [];
+  let ok = false;
+  while (stack.length) {
+    const z = stack.pop(), y = stack.pop(), x = stack.pop();
+    cells.push(x, y, z);
+    if (y <= 0 || seen.size > FLOOD_LIMIT) { ok = true; break; }
+    for (let n = NEIGHBORS.length - 1; n >= 0; n--) {
+      const [dx, dy, dz] = NEIGHBORS[n];
+      const nx = x + dx, ny = y + dy, nz = z + dz;
+      if (ny < 0 || ny >= H) continue;
+      if (!isLoaded(nx, nz)) { ok = true; break; }
+      if (!get(nx, ny, nz)) continue;
+      const k = cellKey(nx, ny, nz);
+      if (seen.has(k)) continue;
+      if (supported.has(k)) { ok = true; break; }
+      seen.add(k);
+      stack.push(nx, ny, nz);
+    }
+    if (ok) break;
   }
+  return { supported: ok, keys: seen, cells };
 }
 
 function detachComponent(cells) {
-  const n = cells.length;
   const vox = [];
-  for (let i = 0; i < n; i++) {
-    const k = cells[i];
-    const m = grid[k];
-    const x = cellX(k), y = cellY(k), z = cellZ(k);
-    if (m !== M.WATER) vox.push({ x, y, z, m, b: burn[k] });
-    grid[k] = 0; burn[k] = 0;
-    markDirty(x, y, z);
+  for (let i = 0; i < cells.length; i += 3) {
+    const x = cells[i], y = cells[i + 1], z = cells[i + 2];
+    const m = get(x, y, z);
+    if (!m) continue;
+    if (m !== M.WATER) vox.push({ x, y, z, m, b: getBurn(x, y, z) });
+    setVoxel(x, y, z, 0);
   }
-  voxelTotal -= n;
   statsDirty = true;
   // Tiny bits (and stray water) just become debris
   if (vox.length <= 3) {
@@ -594,13 +632,13 @@ function detachComponent(cells) {
       voxelColor(v.x, v.y, v.z, v.m, v.b, _c);
       spawnDebris(v.x + 0.5, v.y + 0.5, v.z + 0.5, _c, rand(-1, 1), 0, rand(-1, 1));
     }
-    stats.destroyed += n;
+    stats.destroyed += vox.length;
     return;
   }
 
-  const set = new Set();
-  for (const v of vox) set.add(idx(v.x, v.y, v.z));
-  const occ = (x, y, z) => inBounds(x, y, z) && set.has(idx(x, y, z));
+  const setK = new Set();
+  for (const v of vox) setK.add(cellKey(v.x, v.y, v.z));
+  const occ = (x, y, z) => y >= 0 && y < H && setK.has(cellKey(x, y, z));
   bodyBuilder.reset();
   for (const v of vox) bodyBuilder.emit(v.x, v.y, v.z, v.m, v.b, occ);
   const mesh = new THREE.Mesh(bodyBuilder.toGeometry(), chunkMat);
@@ -612,8 +650,8 @@ function detachComponent(cells) {
 
 function blocksBody(x, y, z) {
   if (y < 0) return true;
-  if (!inBounds(x, y, z)) return false;
-  const m = grid[idx(x, y, z)];
+  if (!isLoaded(x, z)) return true;
+  const m = get(x, y, z);
   return m !== 0 && m !== M.WATER;
 }
 
@@ -649,7 +687,7 @@ function landBody(b, k) {
   for (const v of b.vox) {
     const y = v.y - k;
     center.x += v.x; center.y += y; center.z += v.z;
-    if (Math.random() < shatter || !inBounds(v.x, y, v.z) || blocksBody(v.x, y, v.z)) {
+    if (Math.random() < shatter || y >= H || blocksBody(v.x, y, v.z)) {
       voxelColor(v.x, v.y, v.z, v.m, v.b, _c);
       spawnDebris(v.x + 0.5, y + 0.5, v.z + 0.5, _c, rand(-4, 4) * shatter, rand(1, 7) * shatter, rand(-4, 4) * shatter);
       stats.destroyed++;
@@ -659,7 +697,6 @@ function landBody(b, k) {
     setVoxel(v.x, y, v.z, v.m, v.b);
     placed++;
   }
-  voxelTotal += placed;
   statsDirty = true;
   center.divideScalar(b.vox.length);
   const size = Math.sqrt(b.vox.length) / 10;
@@ -677,7 +714,7 @@ function landBody(b, k) {
       });
     }
   }
-  if (shatter > 0) collapsePending = true;
+  if (shatter > 0) { for (const v of b.vox) touched.push(v.x, v.y - k, v.z); collapsePending = true; }
 }
 
 // ============================================================================
@@ -691,10 +728,10 @@ const PW = 0.3, PH = 1.8, EYE = 1.62;
 let stepSmooth = 0;
 
 function solidForPlayer(x, y, z) {
-  if (x < 0 || z < 0 || x >= W || z >= D) return true; // invisible walls at the map edge
   if (y < 0) return true;
   if (y >= H) return false;
-  const m = grid[idx(x, y, z)];
+  if (!isLoaded(x, z)) return true; // don't fall into terrain that hasn't streamed in yet
+  const m = get(x, y, z);
   return m !== 0 && m !== M.WATER;
 }
 
@@ -746,7 +783,7 @@ function moveHorizontal(axis, delta) {
 }
 
 const keys = new Set();
-const cellAt = (x, y, z) => grid[idx(clamp(Math.floor(x), 0, W - 1), clamp(Math.floor(y), 0, H - 1), clamp(Math.floor(z), 0, D - 1))];
+const cellAt = (x, y, z) => get(Math.floor(x), Math.floor(y), Math.floor(z));
 
 function updatePlayer(dt) {
   const p = player.pos;
@@ -810,18 +847,13 @@ function raycast(origin, dir, maxDist) {
   let t = 0;
   const normal = new THREE.Vector3();
   while (t <= maxDist) {
-    if (inBounds(x, y, z) && grid[idx(x, y, z)]) {
-      return { x, y, z, cell: idx(x, y, z), t, normal, point: origin.clone().addScaledVector(dir, t) };
+    if (get(x, y, z)) {
+      return { x, y, z, cell: 1, t, normal, point: origin.clone().addScaledVector(dir, t) };
     }
-    if (y < 0 && sy < 0) break;
+    if ((y < 0 && sy < 0) || (y >= H && sy > 0)) break;
     if (tmx < tmy && tmx < tmz) { x += sx; t = tmx; tmx += tdx; normal.set(-sx, 0, 0); }
     else if (tmy < tmz)         { y += sy; t = tmy; tmy += tdy; normal.set(0, -sy, 0); }
     else                        { z += sz; t = tmz; tmz += tdz; normal.set(0, 0, -sz); }
-  }
-  // Outside the map: hit the outer ground plane
-  if (dir.y < 0) {
-    const tg = (1 - origin.y) / dir.y;
-    if (tg <= maxDist) return { cell: -1, t: tg, normal: new THREE.Vector3(0, 1, 0), point: origin.clone().addScaledVector(dir, tg) };
   }
   return null;
 }
@@ -957,7 +989,7 @@ function useHammer() {
   sfx.hammer();
   const center = new THREE.Vector3(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
   const face = hit.point.clone().addScaledVector(hit.normal, 0.05);
-  if (grid[hit.cell] === M.BEDROCK) {
+  if (get(hit.x, hit.y, hit.z) === M.BEDROCK) {
     burst(face, 6, { speed: 4, life: 0.4, s0: 0.04, s1: 0.08, color: 0xfff2a0, additive: true });
     return;
   }
@@ -1074,8 +1106,7 @@ function throwProjectile(kind) {
 function cellSolid(p) {
   const x = Math.floor(p.x), y = Math.floor(p.y), z = Math.floor(p.z);
   if (y < 0) return true;
-  if (!inBounds(x, y, z)) return p.y < 1;
-  const m = grid[idx(x, y, z)];
+  const m = get(x, y, z);
   return m !== 0 && m !== M.WATER;
 }
 
@@ -1191,20 +1222,19 @@ function updateHoles(dt) {
       h.tick += 0.05;
       const R = h.r;
       const { x: cx, y: cy, z: cz } = h.pos;
-      const x0 = Math.max(0, Math.floor(cx - R)), x1 = Math.min(W - 1, Math.ceil(cx + R));
+      const x0 = Math.floor(cx - R), x1 = Math.ceil(cx + R);
       const y0 = Math.max(0, Math.floor(cy - R)), y1 = Math.min(H - 1, Math.ceil(cy + R));
-      const z0 = Math.max(0, Math.floor(cz - R)), z1 = Math.min(D - 1, Math.ceil(cz + R));
+      const z0 = Math.floor(cz - R), z1 = Math.ceil(cz + R);
       let budget = 260;
       for (let y = y0; y <= y1 && budget > 0; y++)
         for (let z = z0; z <= z1 && budget > 0; z++)
           for (let x = x0; x <= x1 && budget > 0; x++) {
-            const k = idx(x, y, z);
-            const m = grid[k];
+            const m = get(x, y, z);
             if (!m || m === M.BEDROCK) continue;
             const dist = Math.hypot(x + 0.5 - cx, y + 0.5 - cy, z + 0.5 - cz);
             if (dist > R || Math.random() > 0.05 + 0.25 * (1 - dist / R)) continue;
-            const b = burn[k];
-            removeCell(k);
+            const b = getBurn(x, y, z);
+            removeCell(x, y, z);
             budget--;
             if (m === M.WATER) continue;
             voxelColor(x, y, z, m, b, _c);
@@ -1444,14 +1474,23 @@ function clearDynamic() {
   for (const m of missiles) scene.remove(m.mesh, m.marker);
   missiles.length = 0;
   tntQueue.length = 0;
+  touched = [];
   collapsePending = false;
 }
 
-function resetWorld() {
+let worldSeed = 0;
+function resetWorld(seed = (Math.random() * 1e9) | 0) {
   clearDynamic();
-  const spawn = generateWorld();
-  flushChunks();
-  voxelTotal = countVoxels();
+  for (const mesh of sectionMeshes.values()) { scene.remove(mesh); mesh.geometry.dispose(); }
+  sectionMeshes.clear();
+  activeColumns.clear();
+  worldSeed = seed;
+  resetWorldData(seed);
+  const spawn = spawnPoint();
+  player.pos.set(spawn.x, spawn.y, spawn.z);
+  // Build the area around the player up front so there's ground to stand on
+  streamChunks(0);
+  flushSections(Infinity);
   stats.destroyed = 0;
   statsDirty = true;
   player.pos.set(spawn.x, spawn.y, spawn.z);
@@ -1470,6 +1509,8 @@ document.getElementById('loading').classList.add('hidden');
 
 const clock = new THREE.Clock();
 let walkPhase = 0;
+let hudTimer = 0;
+const BIOME_NAMES = { plains: 'Plains', forest: 'Forest', autumn: 'Autumn woods', desert: 'Desert', snow: 'Tundra', mountains: 'Mountains', lake: 'Lake' };
 
 function update(dt) {
   blastLightLevel = 0;
@@ -1506,7 +1547,19 @@ function update(dt) {
   updateDebris(dt);
   updateParticles(dt);
   updateEffects(dt);
-  flushChunks();
+  streamChunks(3);
+  flushSections(14);
+
+  // Keep the shadow camera centred on the player
+  sun.target.position.set(Math.round(player.pos.x), 0, Math.round(player.pos.z));
+  sun.position.copy(sun.target.position).add(SUN_OFFSET);
+  hudTimer -= dt;
+  if (hudTimer <= 0) {
+    hudTimer = 0.25;
+    const px = Math.floor(player.pos.x), pz = Math.floor(player.pos.z);
+    biomeEl.textContent = BIOME_NAMES[biomeAt(px, pz)];
+    coordsEl.textContent = `${px}, ${Math.floor(player.pos.y)}, ${pz}`;
+  }
 
   blastLight.intensity = blastLightLevel;
   flashEl.style.opacity = String(flashLevel);
@@ -1555,6 +1608,7 @@ window.voxelGame = {
   setLook: (yaw, pitch) => { player.yaw = yaw; player.pitch = pitch; },
   advance: (sec) => { for (let t = 0; t < sec; t += 1 / 30) update(1 / 30); render(); },
   blast: (x, y, z, r) => explode(new THREE.Vector3(x, y, z), r, { force: 5, debrisChance: 0.3 }),
-  get voxels() { return voxelTotal; },
+  get seed() { return worldSeed; },
+  get sections() { return sectionMeshes.size; },
   get bodies() { return bodies.length; },
 };

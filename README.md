@@ -39,21 +39,23 @@ Then go to http://localhost:8000. You need a desktop browser, because the game u
 
 ## World
 
-The map is 128 × 128 × 64 blocks and contains:
+The world is **procedurally generated and infinite**. Chunks generate around you as you explore and unload once you're far away. Chunks you've damaged stay in memory, so your craters are still there when you come back. Press **R** to start a new world with a new random seed.
 
-- a castle with towers and a keep
-- a city of skyscrapers
-- a village with a church
-- desert pyramids
-- snowy mountains
-- a lake with a dock
-- forests
+- **Biomes:** plains, forest, autumn woods, desert, tundra, snowy mountains and lakes
+- **Structures:** the world is split into 48×48 regions, and each region may hold a structure that suits its biome:
+  - castles with towers and a keep
+  - city blocks of skyscrapers
+  - villages, sometimes with a church
+  - desert pyramids (with a surprise inside)
+  - mountain watchtowers
+  - ruins
+  - TNT caches
+- **TNT** (bright red blocks) explodes when it's hit, so it can set off chain reactions. Some is buried underground, too.
+- **Structural collapse:** when blocks lose their connection to the ground, they fall as one solid piece and partly shatter into rubble on a hard landing.
 
-**TNT** (bright red blocks) explodes when it's hit, so it can set off chain reactions.
-
-**Structural collapse:** when blocks lose their connection to the ground, they fall as one solid piece. If a piece lands hard enough, part of it shatters into rubble.
+You always spawn in front of a castle, with a TNT pyramid on the plaza behind you.
 
 ## Code layout
 
-- `world.js`: voxel grid, chunk meshing with face culling and ambient occlusion, and world generation
-- `main.js`: rendering, player physics, tools, explosions, collapse, effects, audio and HUD
+- `world.js`: chunk column storage, terrain and biome noise, structure placement, and chunk meshing with face culling and ambient occlusion
+- `main.js`: chunk streaming, rendering, player physics, tools, explosions, collapse, effects, audio and HUD

@@ -1,19 +1,20 @@
-// World storage, chunk meshing and map generation.
+// Infinite voxel world: chunked storage, on-demand procedural generation and meshing.
 import * as THREE from 'three';
 
 // ============================================================================
 // Dimensions & materials
 // ============================================================================
-export const W = 128, D = 128, H = 64;
-export const N = W * D * H;
-export const CS = 16;
-export const CX = W / CS, CY = H / CS, CZ = D / CS;
-export const WATER_LEVEL = 7;
+export const H = 64;           // world height
+export const CS = 16;          // chunk size (x/z) and section height
+export const SECTIONS = H / CS;
+export const WATER_LEVEL = 12;
+export const REGION = 48;      // structure placement grid
 
 export const M = {
   AIR: 0, BEDROCK: 1, DIRT: 2, GRASS: 3, STONE: 4, BRICK: 5, WOOD: 6, GLASS: 7, ROOF: 8,
   LEAVES: 9, SAND: 10, SNOW: 11, WATER: 12, CONCRETE: 13, ASPHALT: 14, PLANKS: 15,
   SANDSTONE: 16, GOLD: 17, TNT: 18, COBBLE: 19, PINE: 20, CACTUS: 21, METAL: 22, DARKCON: 23, CLOTH: 24,
+  BIRCH: 25, AUTUMN: 26, MOSSY: 27,
 };
 
 export const MAT_HEX = [];
@@ -42,52 +43,125 @@ MAT_HEX[M.CACTUS] = 0x4f9a3a;
 MAT_HEX[M.METAL] = 0x9aa4ae;
 MAT_HEX[M.DARKCON] = 0x6d6f74;
 MAT_HEX[M.CLOTH] = 0xc8202a;
+MAT_HEX[M.BIRCH] = 0xe6e2d6;
+MAT_HEX[M.AUTUMN] = 0xd9772a;
+MAT_HEX[M.MOSSY] = 0x6f7f5e;
 
 const MAT_LIN = MAT_HEX.map((h) => new THREE.Color(h)); // linear-space colours for vertex colours
 const CHAR = new THREE.Color(0x15110d);
 const FLAT_SHADE = new Set([M.GLASS, M.WATER, M.GOLD, M.TNT]);
 
 // ============================================================================
-// Grid
+// Chunk column storage
 // ============================================================================
-export const grid = new Uint8Array(N);   // material per cell
-export const burn = new Uint8Array(N);   // scorch level per cell (0..255)
+const OFF = 32768;
+export const colKey = (cx, cz) => (cx + OFF) * 65536 + (cz + OFF);
+export const sectionKey = (cx, cy, cz) => colKey(cx, cz) * SECTIONS + cy;
+export function decodeSection(key) {
+  const cy = key % SECTIONS;
+  const ck = (key - cy) / SECTIONS;
+  return { cx: Math.floor(ck / 65536) - OFF, cz: (ck % 65536) - OFF, cy };
+}
+// Unique numeric key for any world cell (used by collapse flood fills)
+const KOFF = 1 << 20;
+export const cellKey = (x, y, z) => ((x + KOFF) * 2097152 + (z + KOFF)) * 64 + y;
 
-export const idx = (x, y, z) => x + W * (z + D * y);
-export const inBounds = (x, y, z) => x >= 0 && x < W && y >= 0 && y < H && z >= 0 && z < D;
-export const get = (x, y, z) => (inBounds(x, y, z) ? grid[idx(x, y, z)] : 0);
-export const cellX = (k) => k % W;
-export const cellZ = (k) => ((k / W) | 0) % D;
-export const cellY = (k) => (k / (W * D)) | 0;
+class Column {
+  constructor(cx, cz) {
+    this.cx = cx; this.cz = cz;
+    this.grid = new Uint8Array(CS * CS * H);
+    this.burn = new Uint8Array(CS * CS * H);
+    this.modified = false;
+  }
+}
+const columns = new Map();
+let lastKey = -1, lastCol = null;
 
-export const chunkIndex = (cx, cy, cz) => cx + CX * (cz + CZ * cy);
-export const dirtyChunks = new Set();
+export function getColumn(cx, cz) {
+  const k = colKey(cx, cz);
+  if (k === lastKey) return lastCol;
+  const c = columns.get(k);
+  if (c) { lastKey = k; lastCol = c; }
+  return c;
+}
+const local = (x, y, z) => (x & 15) + CS * ((z & 15) + CS * y);
+
+export function get(x, y, z) {
+  if (y < 0 || y >= H) return 0;
+  const c = getColumn(x >> 4, z >> 4);
+  return c ? c.grid[local(x, y, z)] : 0;
+}
+export function getBurn(x, y, z) {
+  if (y < 0 || y >= H) return 0;
+  const c = getColumn(x >> 4, z >> 4);
+  return c ? c.burn[local(x, y, z)] : 0;
+}
+export function isLoaded(x, z) { return !!getColumn(x >> 4, z >> 4); }
+
+// Dirty sections: "urgent" ones come from gameplay edits, "load" ones from streaming
+export const dirtyUrgent = new Set();
+export const dirtyLoad = new Set();
 
 export function markDirty(x, y, z) {
-  // A cell change can affect faces/AO in any chunk within 1 cell of it
-  const cx0 = Math.max(0, (x - 1) >> 4), cx1 = Math.min(CX - 1, (x + 1) >> 4);
-  const cy0 = Math.max(0, (y - 1) >> 4), cy1 = Math.min(CY - 1, (y + 1) >> 4);
-  const cz0 = Math.max(0, (z - 1) >> 4), cz1 = Math.min(CZ - 1, (z + 1) >> 4);
+  const cx0 = (x - 1) >> 4, cx1 = (x + 1) >> 4;
+  const cy0 = Math.max(0, (y - 1) >> 4), cy1 = Math.min(SECTIONS - 1, (y + 1) >> 4);
+  const cz0 = (z - 1) >> 4, cz1 = (z + 1) >> 4;
   for (let cy = cy0; cy <= cy1; cy++)
     for (let cz = cz0; cz <= cz1; cz++)
-      for (let cx = cx0; cx <= cx1; cx++) dirtyChunks.add(chunkIndex(cx, cy, cz));
+      for (let cx = cx0; cx <= cx1; cx++) dirtyUrgent.add(sectionKey(cx, cy, cz));
 }
 
-export function markAllDirty() {
-  for (let i = 0; i < CX * CY * CZ; i++) dirtyChunks.add(i);
-}
-
-export function setVoxel(x, y, z, mat, b = 0) {
-  if (!inBounds(x, y, z)) return;
-  const k = idx(x, y, z);
-  grid[k] = mat;
-  burn[k] = mat ? b : 0;
+export function set(x, y, z, mat, b = 0) {
+  if (y < 0 || y >= H) return;
+  const c = getColumn(x >> 4, z >> 4);
+  if (!c) return;
+  const i = local(x, y, z);
+  c.grid[i] = mat;
+  c.burn[i] = mat ? b : 0;
+  c.modified = true;
   markDirty(x, y, z);
 }
 
-export function addBurn(k, amount) {
-  const v = burn[k] + amount;
-  burn[k] = v > 255 ? 255 : v;
+export function addBurn(x, y, z, amount) {
+  const c = getColumn(x >> 4, z >> 4);
+  if (!c || y < 0 || y >= H) return;
+  const i = local(x, y, z);
+  const v = c.burn[i] + amount;
+  c.burn[i] = v > 255 ? 255 : v;
+  c.modified = true;
+  markDirty(x, y, z);
+}
+
+export function loadColumn(cx, cz) {
+  let c = getColumn(cx, cz);
+  if (!c) {
+    c = generateColumn(cx, cz);
+    columns.set(colKey(cx, cz), c);
+  }
+  for (let cy = 0; cy < SECTIONS; cy++) dirtyLoad.add(sectionKey(cx, cy, cz));
+  // Neighbours can now cull faces against this column
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    if (getColumn(cx + dx, cz + dz)) for (let cy = 0; cy < SECTIONS; cy++) dirtyLoad.add(sectionKey(cx + dx, cy, cz + dz));
+  }
+  return c;
+}
+
+// Drop an unmodified column's data (it regenerates identically). Edited columns stay in memory.
+export function unloadColumn(cx, cz) {
+  const k = colKey(cx, cz);
+  const c = columns.get(k);
+  if (!c || c.modified) return;
+  columns.delete(k);
+  if (lastKey === k) { lastKey = -1; lastCol = null; }
+}
+
+export function resetWorld(seed) {
+  columns.clear();
+  lastKey = -1; lastCol = null;
+  dirtyUrgent.clear();
+  dirtyLoad.clear();
+  plotCache.clear();
+  setSeed(seed);
 }
 
 // ============================================================================
@@ -138,6 +212,7 @@ export class MeshBuilder {
   // occ(x,y,z) -> true if that cell hides a face
   emit(x, y, z, mat, b, occ) {
     const p = [x, y, z], q = [0, 0, 0], ao = [0, 0, 0, 0];
+    const a = [0, 0, 0], bq = [0, 0, 0], cq = [0, 0, 0];
     for (let f = 0; f < 6; f++) {
       const F = FACES[f];
       q[0] = x + F.n[0]; q[1] = y + F.n[1]; q[2] = z + F.n[2];
@@ -145,14 +220,13 @@ export class MeshBuilder {
       voxelColor(x, y, z, mat, b, this._c, F.d !== 1 || F.s < 0);
       const base = this.pos.length / 3;
       for (let c = 0; c < 4; c++) {
-        const [cu, cv] = F.corners[c];
-        const vx = [p[0], p[1], p[2]];
-        if (F.s > 0) vx[F.d] += 1;
-        vx[F.u] += cu; vx[F.v] += cv;
-        this.pos.push(vx[0], vx[1], vx[2]);
+        const cu = F.corners[c][0], cv = F.corners[c][1];
+        const vx0 = p[0] + (F.d === 0 && F.s > 0 ? 1 : 0) + (F.u === 0 ? cu : 0) + (F.v === 0 ? cv : 0);
+        const vx1 = p[1] + (F.d === 1 && F.s > 0 ? 1 : 0) + (F.u === 1 ? cu : 0) + (F.v === 1 ? cv : 0);
+        const vx2 = p[2] + (F.d === 2 && F.s > 0 ? 1 : 0) + (F.u === 2 ? cu : 0) + (F.v === 2 ? cv : 0);
+        this.pos.push(vx0, vx1, vx2);
         this.nor.push(F.n[0], F.n[1], F.n[2]);
-        // AO
-        const a = [q[0], q[1], q[2]], bq = [q[0], q[1], q[2]], cq = [q[0], q[1], q[2]];
+        a[0] = bq[0] = cq[0] = q[0]; a[1] = bq[1] = cq[1] = q[1]; a[2] = bq[2] = cq[2] = q[2];
         a[F.u] += cu ? 1 : -1;
         bq[F.v] += cv ? 1 : -1;
         cq[F.u] += cu ? 1 : -1; cq[F.v] += cv ? 1 : -1;
@@ -181,31 +255,36 @@ export class MeshBuilder {
   }
 }
 
-export function gridOcc(x, y, z) {
+// Unloaded neighbours count as solid so chunk borders don't render walls
+export function worldOcc(x, y, z) {
   if (y < 0) return true;
-  if (x < 0 || z < 0 || x >= W || z >= D || y >= H) return false;
-  return grid[idx(x, y, z)] !== 0;
+  if (y >= H) return false;
+  const c = getColumn(x >> 4, z >> 4);
+  if (!c) return true;
+  return c.grid[local(x, y, z)] !== 0;
 }
 
 const builder = new MeshBuilder();
-export function buildChunkGeometry(ci) {
-  const cx = ci % CX, cz = ((ci / CX) | 0) % CZ, cy = (ci / (CX * CZ)) | 0;
+export function buildSectionGeometry(key) {
+  const { cx, cy, cz } = decodeSection(key);
+  const col = getColumn(cx, cz);
+  if (!col) return null;
   builder.reset();
   const x0 = cx * CS, y0 = cy * CS, z0 = cz * CS;
-  for (let y = y0; y < y0 + CS; y++)
-    for (let z = z0; z < z0 + CS; z++)
-      for (let x = x0; x < x0 + CS; x++) {
-        const k = idx(x, y, z);
-        const m = grid[k];
-        if (m) builder.emit(x, y, z, m, burn[k], gridOcc);
+  for (let ly = 0; ly < CS; ly++)
+    for (let lz = 0; lz < CS; lz++)
+      for (let lx = 0; lx < CS; lx++) {
+        const i = lx + CS * (lz + CS * (y0 + ly));
+        const m = col.grid[i];
+        if (m) builder.emit(x0 + lx, y0 + ly, z0 + lz, m, col.burn[i], worldOcc);
       }
   return builder.toGeometry();
 }
 
 // ============================================================================
-// Map generation
+// Noise
 // ============================================================================
-function mulberry32(a) {
+export function mulberry32(a) {
   return function () {
     a |= 0; a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
@@ -226,7 +305,7 @@ function makeNoise(seed) {
   return (x, z, oct = 4) => {
     let sum = 0, amp = 1, freq = 1, norm = 0;
     for (let i = 0; i < oct; i++) {
-      sum += value(x * freq, z * freq) * amp;
+      sum += value(x * freq + i * 17.3, z * freq - i * 9.1) * amp;
       norm += amp; amp *= 0.5; freq *= 2;
     }
     return sum / norm;
@@ -236,105 +315,282 @@ function makeNoise(seed) {
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
 const smoothstep = (a, b, v) => { const t = clamp01((v - a) / (b - a)); return t * t * (3 - 2 * t); };
 
-// Regions (x0, z0, x1, z1)
-export const REGIONS = {
-  castle:  [44, 8, 80, 44],
-  city:    [70, 54, 118, 98],
-  village: [6, 60, 58, 114],
-  desert:  [84, 100, 127, 127],
-  tntPark: [58, 58, 68, 68],
-  plaza:   [52, 44, 74, 60],
-};
-const FLAT = 9; // ground surface height inside regions
-
-function rectWeight(x, z, r, margin) {
-  const dx = Math.max(r[0] - x, 0, x - r[2]);
-  const dz = Math.max(r[1] - z, 0, z - r[3]);
-  const d = Math.hypot(dx, dz);
-  return 1 - smoothstep(0, margin, d);
+let SEED = 1;
+let nCont, nHill, nMount, nRidge, nTemp, nMoist, nDetail;
+function setSeed(seed) {
+  SEED = seed | 0;
+  nCont = makeNoise(SEED + 1);
+  nHill = makeNoise(SEED + 2);
+  nMount = makeNoise(SEED + 3);
+  nRidge = makeNoise(SEED + 4);
+  nTemp = makeNoise(SEED + 5);
+  nMoist = makeNoise(SEED + 6);
+  nDetail = makeNoise(SEED + 7);
 }
-const inRect = (x, z, r, pad = 0) => x >= r[0] - pad && x <= r[2] + pad && z >= r[1] - pad && z <= r[3] + pad;
+setSeed(1);
 
-export function generateWorld(seed = (Math.random() * 1e9) | 0) {
-  grid.fill(0);
-  burn.fill(0);
-  const rng = mulberry32(seed);
-  const noise = makeNoise(seed);
-  const ridge = makeNoise(seed + 17);
-  const r = (a, b) => a + rng() * (b - a);
-  const ri = (a, b) => Math.floor(r(a, b + 1));
+// ============================================================================
+// Terrain & biomes
+// ============================================================================
+function baseHeight(x, z) {
+  const cont = nCont(x / 300, z / 300, 3);
+  const hills = nHill(x / 55, z / 55, 4);
+  let h = 17 + cont * 11 + hills * 5;
+  const mm = smoothstep(0.12, 0.45, nMount(x / 280, z / 280, 2));
+  if (mm > 0) {
+    const r = 1 - Math.abs(nRidge(x / 70, z / 70, 3));
+    h += mm * (r * r * 36 + hills * 5 + 4);
+  }
+  return h;
+}
 
-  const S = (x, y, z, m) => { if (inBounds(x, y, z)) { const k = idx(x, y, z); grid[k] = m; burn[k] = 0; } };
-  const fill = (x0, x1, y0, y1, z0, z1, m) => {
-    for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) S(x, y, z, m);
+export function biomeAt(x, z) {
+  const h = baseHeight(x, z);
+  if (h >= 34) return 'mountains';
+  if (h < WATER_LEVEL) return 'lake';
+  const t = nTemp(x / 380, z / 380, 2);
+  if (t > 0.22) return 'desert';
+  if (t < -0.32) return 'snow';
+  const m = nMoist(x / 260, z / 260, 2);
+  if (m > 0.18) return 'forest';
+  if (m < -0.25) return 'autumn';
+  return 'plains';
+}
+
+// ---------------- Structure plots ----------------
+const plotCache = new Map();
+const STRUCTURE_SIZE = { castle: 34, city: 36, village: 38, pyramid: 25, watchtower: 9, ruins: 22, tnt: 14, plaza: 40 };
+
+function choosePlot(rx, rz) {
+  const rng = mulberry32((hash3(rx, SEED, rz) * 4294967296) | 0);
+  // The spawn area always has a castle with an open plaza in front of it
+  let type = null;
+  if (rx === 0 && rz === 0) type = 'castle';
+  else if (rx === 0 && rz === 1) type = 'plaza';
+  const cx = rx * REGION + REGION / 2, cz = rz * REGION + REGION / 2;
+  const biome = biomeAt(cx, cz);
+  if (!type) {
+    const r = rng();
+    if (biome === 'lake') return null;
+    if (biome === 'desert') type = r < 0.42 ? 'pyramid' : r < 0.52 ? 'tnt' : r < 0.62 ? 'ruins' : null;
+    else if (biome === 'mountains') type = r < 0.25 ? 'watchtower' : null;
+    else if (biome === 'snow') type = r < 0.15 ? 'watchtower' : r < 0.3 ? 'castle' : r < 0.4 ? 'village' : null;
+    else {
+      type = r < 0.1 ? 'castle' : r < 0.24 ? 'city' : r < 0.46 ? 'village' : r < 0.56 ? 'ruins'
+        : r < 0.63 ? 'watchtower' : r < 0.7 ? 'tnt' : null;
+    }
+  }
+  if (!type) return null;
+  const size = STRUCTURE_SIZE[type];
+  const slack = REGION - 6 - size;
+  const ox = rx * REGION + 3 + Math.floor(rng() * Math.max(1, slack));
+  const oz = rz * REGION + 3 + Math.floor(rng() * Math.max(1, slack));
+  let base = Math.round(baseHeight(ox + size / 2, oz + size / 2));
+  if (rx === 0 && (rz === 0 || rz === 1)) base = Math.max(Math.round(baseHeight(24, 24)), WATER_LEVEL + 3);
+  if (base <= WATER_LEVEL + 1) return null;
+  if (type === 'city' && base > 26) type = 'village';
+  if (base > H - 22 && type !== 'watchtower') return null;
+  const flatten = type !== 'watchtower' && type !== 'ruins';
+  return { type, x0: ox, z0: oz, x1: ox + size - 1, z1: oz + size - 1, base, flatten, seed: (rng() * 4294967296) | 0 };
+}
+
+function getPlot(rx, rz) {
+  const k = colKey(rx, rz);
+  let p = plotCache.get(k);
+  if (p === undefined) { p = choosePlot(rx, rz); plotCache.set(k, p); }
+  return p;
+}
+
+function rectDist(x, z, p) {
+  const dx = Math.max(p.x0 - x, 0, x - p.x1);
+  const dz = Math.max(p.z0 - z, 0, z - p.z1);
+  return Math.hypot(dx, dz);
+}
+
+function plotsNear(x, z) {
+  const rx = Math.floor(x / REGION), rz = Math.floor(z / REGION);
+  const out = [];
+  for (let dz = -1; dz <= 1; dz++)
+    for (let dx = -1; dx <= 1; dx++) {
+      const p = getPlot(rx + dx, rz + dz);
+      if (p) out.push(p);
+    }
+  return out;
+}
+
+export function terrainHeight(x, z) {
+  let h = baseHeight(x, z);
+  let best = 0, target = h;
+  for (const p of plotsNear(x, z)) {
+    if (!p.flatten) continue;
+    const w = 1 - smoothstep(0, 9, rectDist(x, z, p));
+    if (w > best) { best = w; target = p.base; }
+  }
+  h += (target - h) * best;
+  return Math.max(2, Math.min(H - 6, Math.round(h)));
+}
+
+function insidePlot(x, z, pad) {
+  for (const p of plotsNear(x, z)) if (rectDist(x, z, p) <= pad) return true;
+  return false;
+}
+
+// ============================================================================
+// Column generation
+// ============================================================================
+function generateColumn(cx, cz) {
+  const col = new Column(cx, cz);
+  const g = col.grid;
+  const X0 = cx * CS, Z0 = cz * CS;
+
+  // Clipped writers used by terrain, structures and trees
+  const S = (x, y, z, m) => {
+    if (y < 0 || y >= H) return;
+    const lx = x - X0, lz = z - Z0;
+    if (lx < 0 || lx >= CS || lz < 0 || lz >= CS) return;
+    g[lx + CS * (lz + CS * y)] = m;
   };
+  const G = (x, y, z) => {
+    const lx = x - X0, lz = z - Z0;
+    if (y < 0 || y >= H || lx < 0 || lx >= CS || lz < 0 || lz >= CS) return 0;
+    return g[lx + CS * (lz + CS * y)];
+  };
+  const fill = (x0, x1, y0, y1, z0, z1, m) => {
+    const ax = Math.max(x0, X0), bx = Math.min(x1, X0 + CS - 1);
+    const az = Math.max(z0, Z0), bz = Math.min(z1, Z0 + CS - 1);
+    for (let y = Math.max(0, y0); y <= Math.min(H - 1, y1); y++)
+      for (let z = az; z <= bz; z++)
+        for (let x = ax; x <= bx; x++) g[x - X0 + CS * (z - Z0 + CS * y)] = m;
+  };
+  const W = { S, G, fill };
 
   // ---------------- Terrain ----------------
-  const height = new Int16Array(W * D);
-  const surfaceMat = new Uint8Array(W * D);
-  const LAKE = { x: 28, z: 28, r: 17 };
-
-  for (let z = 0; z < D; z++) {
-    for (let x = 0; x < W; x++) {
-      let h = 9 + noise(x / 38, z / 38) * 6;
-      // Mountains in the north-east
-      const mm = smoothstep(78, 100, x) * smoothstep(50, 30, z);
-      if (mm > 0) {
-        const rd = 1 - Math.abs(ridge(x / 22, z / 22));
-        h += mm * (6 + rd * rd * 34 + noise(x / 9, z / 9) * 4);
-      }
-      // Flatten building regions
-      let wFlat = 0;
-      for (const key in REGIONS) wFlat = Math.max(wFlat, rectWeight(x, z, REGIONS[key], 7));
-      h = h + (FLAT - h) * wFlat;
-      // Lake basin
-      const ld = Math.hypot(x - LAKE.x, z - LAKE.z) + noise(x / 8, z / 8) * 3;
-      if (ld < LAKE.r + 6) h = h + (2.5 - h) * smoothstep(LAKE.r + 6, LAKE.r - 6, ld);
-
-      h = Math.max(1, Math.min(H - 8, Math.round(h)));
-      height[x + z * W] = h;
-
-      let top = M.GRASS;
-      const desert = inRect(x, z, REGIONS.desert) || (x > 82 && z > 96 && noise(x / 6, z / 6) > -0.1 && x + z > 182);
-      if (desert) top = M.SAND;
-      else if (h <= WATER_LEVEL + 1 && ld < LAKE.r + 4) top = M.SAND;
-      else if (h >= 30) top = M.SNOW;
-      else if (h >= 22) top = M.STONE;
-      surfaceMat[x + z * W] = top;
-
+  for (let lz = 0; lz < CS; lz++) {
+    for (let lx = 0; lx < CS; lx++) {
+      const x = X0 + lx, z = Z0 + lz;
+      const h = terrainHeight(x, z);
+      const biome = biomeAt(x, z);
+      let top = M.GRASS, sub = M.DIRT;
+      if (h >= 44) { top = M.SNOW; sub = M.STONE; }
+      else if (h >= 36) { top = M.STONE; sub = M.STONE; }
+      else if (h <= WATER_LEVEL + 1) { top = M.SAND; sub = M.SAND; }
+      else if (biome === 'desert') { top = M.SAND; sub = M.SAND; }
+      else if (biome === 'snow') { top = M.SNOW; sub = M.DIRT; }
       for (let y = 0; y <= h; y++) {
         let m;
         if (y === 0) m = M.BEDROCK;
         else if (y === h) m = top;
-        else if (y >= h - 3) m = top === M.SAND ? M.SAND : top === M.SNOW || top === M.STONE ? M.STONE : M.DIRT;
+        else if (y >= h - 3) m = sub;
         else m = M.STONE;
-        S(x, y, z, m);
+        g[lx + CS * (lz + CS * y)] = m;
       }
-      for (let y = h + 1; y <= WATER_LEVEL; y++) S(x, y, z, M.WATER);
+      for (let y = h + 1; y <= WATER_LEVEL; y++) g[lx + CS * (lz + CS * y)] = M.WATER;
+      // Rare buried TNT pockets for surprise chain reactions
+      if (h > WATER_LEVEL + 2 && hash3(x, SEED + 99, z) < 0.0009) {
+        for (let y = h - 3; y < h; y++) g[lx + CS * (lz + CS * y)] = M.TNT;
+      }
     }
   }
-  const groundAt = (x, z) => height[x + z * W];
-  const g = FLAT + 1;
 
-  // ---------------- Castle ----------------
-  {
-    const [X0, Z0, X1, Z1] = [48, 12, 76, 40];
-    // Curtain wall (2 thick, 9 tall)
+  // ---------------- Structures ----------------
+  const rx0 = Math.floor((X0 - REGION) / REGION), rx1 = Math.floor((X0 + CS + REGION) / REGION);
+  const rz0 = Math.floor((Z0 - REGION) / REGION), rz1 = Math.floor((Z0 + CS + REGION) / REGION);
+  for (let rz = rz0; rz <= rz1; rz++)
+    for (let rx = rx0; rx <= rx1; rx++) {
+      const p = getPlot(rx, rz);
+      if (!p) continue;
+      if (p.x1 + 3 < X0 || p.x0 - 3 >= X0 + CS || p.z1 + 3 < Z0 || p.z0 - 3 >= Z0 + CS) continue;
+      BUILDERS[p.type](W, p, mulberry32(p.seed));
+    }
+
+  // ---------------- Trees ----------------
+  for (let z = Z0 - 3; z < Z0 + CS + 3; z++) {
+    for (let x = X0 - 3; x < X0 + CS + 3; x++) {
+      const r = hash3(x, SEED + 31, z);
+      if (r > 0.04) continue;
+      const biome = biomeAt(x, z);
+      const density = { forest: 0.035, autumn: 0.025, plains: 0.007, snow: 0.012, mountains: 0.006, desert: 0.003, lake: 0 }[biome];
+      if (r > density) continue;
+      const h = terrainHeight(x, z);
+      if (h <= WATER_LEVEL || h >= 42) continue;
+      if (insidePlot(x, z, 3)) continue;
+      const r2 = hash3(x, SEED + 57, z);
+      let kind;
+      if (biome === 'desert') kind = 'cactus';
+      else if (biome === 'snow' || biome === 'mountains') kind = 'pine';
+      else if (biome === 'autumn') kind = r2 < 0.5 ? 'autumn' : r2 < 0.8 ? 'birch' : 'oak';
+      else if (biome === 'forest') kind = r2 < 0.35 ? 'pine' : r2 < 0.55 ? 'birch' : 'oak';
+      else kind = r2 < 0.75 ? 'oak' : 'birch';
+      plantTree(W, x, h + 1, z, kind, r2);
+    }
+  }
+  return col;
+}
+
+function plantTree({ S, G, fill }, x, base, z, kind, r) {
+  const rnd = mulberry32((r * 4294967296) | 0);
+  if (kind === 'cactus') {
+    const hgt = 2 + Math.floor(rnd() * 3);
+    fill(x, x, base, base + hgt, z, z, M.CACTUS);
+    if (hgt > 2) { S(x + 1, base + 2, z, M.CACTUS); S(x + 1, base + 3, z, M.CACTUS); }
+    return;
+  }
+  if (kind === 'pine') {
+    const trunk = 6 + Math.floor(rnd() * 4);
+    fill(x, x, base, base + trunk - 1, z, z, M.WOOD);
+    for (let i = 0; i < trunk + 1; i++) {
+      const yy = base + 2 + i;
+      const rad = Math.max(0, Math.round((trunk - i) * 0.4));
+      for (let dz = -rad; dz <= rad; dz++)
+        for (let dx = -rad; dx <= rad; dx++)
+          if (dx * dx + dz * dz <= rad * rad + 1 && !(dx === 0 && dz === 0 && i < trunk - 1) && !G(x + dx, yy, z + dz))
+            S(x + dx, yy, z + dz, M.PINE);
+    }
+    S(x, base + trunk + 2, z, M.PINE);
+    return;
+  }
+  const trunk = 4 + Math.floor(rnd() * 3);
+  fill(x, x, base, base + trunk - 1, z, z, kind === 'birch' ? M.BIRCH : M.WOOD);
+  const leaf = kind === 'autumn' ? M.AUTUMN : M.LEAVES;
+  const cy = base + trunk;
+  for (let dy = -2; dy <= 2; dy++)
+    for (let dz = -3; dz <= 3; dz++)
+      for (let dx = -3; dx <= 3; dx++) {
+        const dd = dx * dx + dy * dy * 1.6 + dz * dz;
+        if (dd <= 7.5 + hash3(x + dx, cy + dy, z + dz) * 2 && !G(x + dx, cy + dy, z + dz)) S(x + dx, cy + dy, z + dz, leaf);
+      }
+}
+
+// ============================================================================
+// Structure builders. Each one is deterministic for its plot and writes
+// through the clipped S/fill helpers, so it can be stamped chunk by chunk.
+// ============================================================================
+const BUILDERS = {
+  plaza({ S, fill }, p) {
+    // Open square in front of the spawn castle, with a TNT pyramid to play with
+    const g = p.base + 1;
+    for (let i = 0; i < 4; i++) fill(p.x0 + 26 + i, p.x0 + 32 - i, g + i, g + i, p.z0 + 10 + i, p.z0 + 16 - i, M.TNT);
+    fill(p.x0 + 8, p.x0 + 9, g, g, p.z0 + 12, p.z0 + 13, M.TNT);
+    S(p.x0 + 8, g + 1, p.z0 + 12, M.TNT);
+  },
+
+  castle({ S, fill }, p) {
+    const g = p.base + 1;
+    const X0 = p.x0 + 2, Z0 = p.z0 + 2, X1 = p.x1 - 2, Z1 = p.z1 - 2;
+    const gx = (X0 + X1) >> 1;
     for (let y = g; y < g + 9; y++)
       for (let z = Z0; z <= Z1; z++)
         for (let x = X0; x <= X1; x++) {
           const edge = x <= X0 + 1 || x >= X1 - 1 || z <= Z0 + 1 || z >= Z1 - 1;
           if (!edge) continue;
-          if (z >= Z1 - 1 && x >= 60 && x <= 64 && y < g + 6) continue; // gate
+          if (z >= Z1 - 1 && Math.abs(x - gx) <= 2 && y < g + 6) continue; // gate
           S(x, y, z, M.COBBLE);
         }
     for (let z = Z0; z <= Z1; z++)
       for (let x = X0; x <= X1; x++)
         if ((x === X0 || x === X1 || z === Z0 || z === Z1) && (x + z) % 2 === 0) S(x, g + 9, z, M.COBBLE);
-    // Wooden gate beam
-    fill(60, 64, g + 6, g + 6, Z1 - 1, Z1, M.WOOD);
+    fill(gx - 2, gx + 2, g + 6, g + 6, Z1 - 1, Z1, M.WOOD);
 
-    // Corner towers
     const tower = (tx, tz, size, height) => {
       for (let y = g; y < g + height; y++)
         for (let z = tz; z < tz + size; z++)
@@ -343,21 +599,20 @@ export function generateWorld(seed = (Math.random() * 1e9) | 0) {
             const floor = (y - g) % 5 === 4;
             if (!edge && !floor) continue;
             const mid = x === tx + (size >> 1) || z === tz + (size >> 1);
-            if (edge && mid && (y - g) % 5 === 2) continue; // arrow slits
+            if (edge && mid && (y - g) % 5 === 2) continue;
             S(x, y, z, M.STONE);
           }
       for (let z = tz; z < tz + size; z++)
         for (let x = tx; x < tx + size; x++)
-          if ((x === tx || x === tx + size - 1 || z === tz || z === tz + size - 1) && (x + z) % 2 === 0)
-            S(x, g + height, z, M.STONE);
+          if ((x === tx || x === tx + size - 1 || z === tz || z === tz + size - 1) && (x + z) % 2 === 0) S(x, g + height, z, M.STONE);
     };
     tower(X0 - 2, Z0 - 2, 7, 15);
     tower(X1 - 4, Z0 - 2, 7, 15);
     tower(X0 - 2, Z1 - 4, 7, 15);
     tower(X1 - 4, Z1 - 4, 7, 15);
 
-    // Keep
-    const [KX, KZ, KS, KH] = [57, 20, 11, 23];
+    const KS = 11, KH = 23;
+    const KX = gx - 5, KZ = ((Z0 + Z1) >> 1) - 6;
     for (let y = g; y < g + KH; y++)
       for (let z = KZ; z < KZ + KS; z++)
         for (let x = KX; x < KX + KS; x++) {
@@ -366,37 +621,31 @@ export function generateWorld(seed = (Math.random() * 1e9) | 0) {
           if (!edge && !floor) continue;
           const off = (x - KX) + (z - KZ);
           if (edge && (y - g) % 6 >= 2 && (y - g) % 6 <= 3 && off % 3 === 1) { S(x, y, z, M.GLASS); continue; }
-          if (edge && z === KZ + KS - 1 && x >= KX + 4 && x <= KX + 6 && y < g + 4) continue; // door
+          if (edge && z === KZ + KS - 1 && x >= KX + 4 && x <= KX + 6 && y < g + 4) continue;
           S(x, y, z, M.STONE);
         }
     for (let z = KZ; z < KZ + KS; z++)
       for (let x = KX; x < KX + KS; x++)
         if ((x === KX || x === KX + KS - 1 || z === KZ || z === KZ + KS - 1) && (x + z) % 2 === 0) S(x, g + KH, z, M.STONE);
-    // Flag
     fill(KX + 5, KX + 5, g + KH, g + KH + 6, KZ + 5, KZ + 5, M.WOOD);
     fill(KX + 6, KX + 9, g + KH + 4, g + KH + 6, KZ + 5, KZ + 5, M.CLOTH);
-    // TNT stash in the keep
     fill(KX + 3, KX + 7, g, g + 1, KZ + 3, KZ + 6, M.TNT);
-  }
+  },
 
-  // ---------------- City ----------------
-  {
-    const [X0, Z0, X1, Z1] = REGIONS.city;
-    for (let z = Z0; z <= Z1; z++) for (let x = X0; x <= X1; x++) S(x, FLAT, z, M.ASPHALT);
-    for (let bx = 0; bx < 4; bx++) {
-      for (let bz = 0; bz < 4; bz++) {
-        const x0 = X0 + 3 + bx * 12, z0 = Z0 + 3 + bz * 11;
-        const w = 9, d = 8;
-        if (bx === 1 && bz === 2) {
-          // Park
-          for (let z = z0; z < z0 + d; z++) for (let x = x0; x < x0 + w; x++) S(x, FLAT, z, M.GRASS);
-          plantTree(x0 + 2, z0 + 2, 'oak');
-          plantTree(x0 + 6, z0 + 5, 'oak');
+  city({ S, fill }, p, rng) {
+    const g = p.base + 1;
+    fill(p.x0, p.x1, p.base, p.base, p.z0, p.z1, M.ASPHALT);
+    for (let bx = 0; bx < 3; bx++) {
+      for (let bz = 0; bz < 3; bz++) {
+        const x0 = p.x0 + 2 + bx * 12, z0 = p.z0 + 2 + bz * 12;
+        const w = 9, d = 9;
+        if (rng() < 0.12) {
+          fill(x0, x0 + w - 1, p.base, p.base, z0, z0 + d - 1, M.GRASS);
           continue;
         }
-        const tall = ri(14, 46);
+        const tall = 12 + Math.floor(rng() * 32);
         const top = Math.min(H - 4, g + tall);
-        const wall = [M.CONCRETE, M.DARKCON, M.BRICK, M.CONCRETE][ri(0, 3)];
+        const wall = [M.CONCRETE, M.DARKCON, M.BRICK, M.CONCRETE][Math.floor(rng() * 4)];
         for (let y = g; y < top; y++) {
           const floor = (y - g) % 3 === 0;
           for (let z = z0; z < z0 + d; z++)
@@ -407,23 +656,21 @@ export function generateWorld(seed = (Math.random() * 1e9) | 0) {
               if (!edge) { S(x, y, z, M.CONCRETE); continue; }
               const corner = edgeX && edgeZ;
               const along = edgeZ ? x - x0 : z - z0;
-              if (y < g + 3 && edgeZ && z === z0 + d - 1 && (x === x0 + 4)) continue; // door
-              const win = !corner && !floor && along % 2 === 1;
-              S(x, y, z, win ? M.GLASS : wall);
+              if (y < g + 3 && z === z0 + d - 1 && x === x0 + 4) continue;
+              S(x, y, z, !corner && !floor && along % 2 === 1 ? M.GLASS : wall);
             }
         }
         fill(x0, x0 + w - 1, top, top, z0, z0 + d - 1, wall);
-        if (rng() < 0.5) fill(x0 + 4, x0 + 4, top + 1, Math.min(H - 1, top + ri(2, 5)), z0 + 3, z0 + 3, M.METAL);
+        if (rng() < 0.5) fill(x0 + 4, x0 + 4, top + 1, Math.min(H - 1, top + 2 + Math.floor(rng() * 4)), z0 + 4, z0 + 4, M.METAL);
+        if (rng() < 0.15) fill(x0 + 3, x0 + 5, g, g + 1, z0 + 3, z0 + 5, M.TNT); // basement explosives
       }
     }
-    // A fuel depot of TNT in one alley
-    fill(X1 - 3, X1 - 1, g, g + 2, Z1 - 4, Z1 - 1, M.TNT);
-  }
+  },
 
-  // ---------------- Village ----------------
-  {
-    const house = (x0, z0, w, d, wallMat, roofMat, wallH = 4) => {
-      fill(x0, x0 + w - 1, FLAT, FLAT, z0, z0 + d - 1, M.PLANKS);
+  village({ S, fill }, p, rng) {
+    const g = p.base + 1;
+    const house = (x0, z0, w, d, wallMat, roofMat, wallH) => {
+      fill(x0, x0 + w - 1, p.base, p.base, z0, z0 + d - 1, M.PLANKS);
       for (let y = g; y < g + wallH; y++)
         for (let z = z0; z < z0 + d; z++)
           for (let x = x0; x < x0 + w; x++) {
@@ -431,7 +678,7 @@ export function generateWorld(seed = (Math.random() * 1e9) | 0) {
             if (!edgeX && !edgeZ) continue;
             const corner = edgeX && edgeZ;
             const midX = x0 + (w >> 1);
-            if (edgeZ && z === z0 + d - 1 && x === midX && y < g + 2) continue; // door
+            if (edgeZ && z === z0 + d - 1 && x === midX && y < g + 2) continue;
             const win = !corner && (y === g + 1 || y === g + 2) && ((edgeZ && (x - x0) % 3 === 1 && x !== midX) || (edgeX && (z - z0) % 3 === 1));
             S(x, y, z, win ? M.GLASS : corner ? M.WOOD : wallMat);
           }
@@ -439,33 +686,37 @@ export function generateWorld(seed = (Math.random() * 1e9) | 0) {
         const za = z0 - 1 + i, zb = z0 + d - i;
         if (za > zb) break;
         fill(x0 - 1, x0 + w, g + wallH + i, g + wallH + i, za, zb, roofMat);
-        // gable ends
         if (i > 0) for (let z = za; z <= zb; z++) { S(x0, g + wallH + i - 1, z, wallMat); S(x0 + w - 1, g + wallH + i - 1, z, wallMat); }
       }
     };
-    const spots = [];
-    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) spots.push([10 + i * 16, 64 + j * 16]);
-    spots.forEach(([x, z], n) => {
-      if (n === 4) return; // church goes here
-      const mats = [[M.BRICK, M.ROOF], [M.PLANKS, M.ROOF], [M.COBBLE, M.WOOD], [M.BRICK, M.DARKCON]][ri(0, 3)];
-      house(x + ri(0, 2), z + ri(0, 2), ri(8, 11), ri(7, 9), mats[0], mats[1], ri(4, 5));
+    // Dirt crossroads
+    const mx = p.x0 + 18, mz = p.z0 + 18;
+    fill(p.x0, p.x1, p.base, p.base, mz, mz + 1, M.DIRT);
+    fill(mx, mx + 1, p.base, p.base, p.z0, p.z1, M.DIRT);
+    const quads = [[p.x0 + 2, p.z0 + 2], [p.x0 + 21, p.z0 + 2], [p.x0 + 2, p.z0 + 21], [p.x0 + 21, p.z0 + 21]];
+    const churchAt = Math.floor(rng() * 5); // 4 = no church
+    quads.forEach(([x, z], n) => {
+      if (n === churchAt) {
+        house(x + 1, z + 4, 12, 9, M.STONE, M.DARKCON, 7);
+        const tx = x + 5, tz = z;
+        for (let y = g; y < g + 18; y++)
+          for (let zz = tz; zz < tz + 5; zz++)
+            for (let xx = tx; xx < tx + 5; xx++) {
+              const edge = xx === tx || xx === tx + 4 || zz === tz || zz === tz + 4;
+              if (!edge && (y - g) % 6 !== 5) continue;
+              if (edge && y - g > 12 && (xx === tx + 2 || zz === tz + 2)) continue;
+              S(xx, y, zz, M.STONE);
+            }
+        for (let i = 0; i < 3; i++) fill(tx + i, tx + 4 - i, g + 18 + i * 2, g + 19 + i * 2, tz + i, tz + 4 - i, M.DARKCON);
+        fill(tx + 2, tx + 2, g + 24, g + 26, tz + 2, tz + 2, M.GOLD);
+        return;
+      }
+      const mats = [[M.BRICK, M.ROOF], [M.PLANKS, M.ROOF], [M.COBBLE, M.WOOD], [M.BRICK, M.DARKCON], [M.PLANKS, M.DARKCON]][Math.floor(rng() * 5)];
+      const w = 8 + Math.floor(rng() * 4), d = 7 + Math.floor(rng() * 3);
+      house(x + Math.floor(rng() * 3), z + Math.floor(rng() * 3), w, d, mats[0], mats[1], 4 + Math.floor(rng() * 2));
     });
-    // Church
-    const [cx, cz] = spots[4];
-    house(cx, cz + 3, 12, 9, M.STONE, M.DARKCON, 7);
-    const tx = cx + 4, tz = cz - 2;
-    for (let y = g; y < g + 18; y++)
-      for (let z = tz; z < tz + 5; z++)
-        for (let x = tx; x < tx + 5; x++) {
-          const edge = x === tx || x === tx + 4 || z === tz || z === tz + 4;
-          if (!edge && (y - g) % 6 !== 5) continue;
-          if (edge && (y - g) > 12 && (x === tx + 2 || z === tz + 2)) continue; // belfry openings
-          S(x, y, z, M.STONE);
-        }
-    for (let i = 0; i < 3; i++) fill(tx + i, tx + 4 - i, g + 18 + i * 2, g + 19 + i * 2, tz + i, tz + 4 - i, M.DARKCON);
-    fill(tx + 2, tx + 2, g + 24, g + 26, tz + 2, tz + 2, M.GOLD);
-    // Well
-    const wx = 34, wz = 108;
+    // Well at the crossroads
+    const wx = mx - 1, wz = mz - 1;
     for (let z = wz; z < wz + 4; z++) for (let x = wx; x < wx + 4; x++) {
       const edge = x === wx || x === wx + 3 || z === wz || z === wz + 3;
       S(x, g, z, edge ? M.COBBLE : M.WATER);
@@ -473,89 +724,79 @@ export function generateWorld(seed = (Math.random() * 1e9) | 0) {
     fill(wx, wx, g + 1, g + 3, wz, wz, M.WOOD);
     fill(wx + 3, wx + 3, g + 1, g + 3, wz + 3, wz + 3, M.WOOD);
     fill(wx, wx + 3, g + 4, g + 4, wz, wz + 3, M.ROOF);
-    // Dirt paths
-    for (let x = REGIONS.village[0]; x <= REGIONS.village[2]; x++) for (let dz = 0; dz < 2; dz++) S(x, FLAT, 77 + dz, M.DIRT);
-    for (let z = REGIONS.village[1]; z <= REGIONS.village[3]; z++) for (let dx = 0; dx < 2; dx++) S(23 + dx, FLAT, z, M.DIRT);
-  }
+  },
 
-  // ---------------- Desert pyramids ----------------
-  {
-    const pyramid = (x0, z0, base) => {
-      for (let i = 0; i * 2 < base; i++) {
-        const last = (i + 1) * 2 >= base;
-        fill(x0 + i, x0 + base - 1 - i, g + i, g + i, z0 + i, z0 + base - 1 - i, last ? M.GOLD : M.SANDSTONE);
+  pyramid({ fill }, p, rng) {
+    const g = p.base + 1;
+    const base = rng() < 0.4 ? 17 : 25;
+    const ox = p.x0 + ((25 - base) >> 1), oz = p.z0 + ((25 - base) >> 1);
+    for (let i = 0; i * 2 < base; i++) {
+      const last = (i + 1) * 2 >= base;
+      fill(ox + i, ox + base - 1 - i, g + i, g + i, oz + i, oz + base - 1 - i, last ? M.GOLD : M.SANDSTONE);
+    }
+    // Hidden treasure room... full of TNT
+    const c = (base >> 1);
+    fill(ox + c - 1, ox + c + 1, g + 1, g + 2, oz + c - 1, oz + c + 1, M.TNT);
+  },
+
+  watchtower({ S, fill }, p, rng) {
+    const g = p.base + 1;
+    const hgt = 16 + Math.floor(rng() * 8);
+    const ox = p.x0 + 1, oz = p.z0 + 1;
+    // Foundation reaching down to the (unflattened) ground
+    fill(ox, ox + 6, g - 8, g - 1, oz, oz + 6, M.COBBLE);
+    for (let y = g; y < g + hgt; y++)
+      for (let z = oz; z < oz + 7; z++)
+        for (let x = ox; x < ox + 7; x++) {
+          const edge = x === ox || x === ox + 6 || z === oz || z === oz + 6;
+          const floor = (y - g) % 6 === 5;
+          if (!edge && !floor) continue;
+          if (edge && (y - g) % 6 === 2 && (x === ox + 3 || z === oz + 3)) continue;
+          S(x, y, z, rng() < 0.15 ? M.MOSSY : M.STONE);
+        }
+    fill(ox - 1, ox + 7, g + hgt, g + hgt, oz - 1, oz + 7, M.PLANKS);
+    for (let z = oz - 1; z <= oz + 7; z++)
+      for (let x = ox - 1; x <= ox + 7; x++)
+        if ((x === ox - 1 || x === ox + 7 || z === oz - 1 || z === oz + 7) && (x + z) % 2 === 0) S(x, g + hgt + 1, z, M.STONE);
+    fill(ox + 3, ox + 3, g + hgt + 1, g + hgt + 5, oz + 3, oz + 3, M.WOOD);
+    fill(ox + 4, ox + 6, g + hgt + 3, g + hgt + 5, oz + 3, oz + 3, M.CLOTH);
+  },
+
+  ruins({ S }, p, rng) {
+    const walls = 4 + Math.floor(rng() * 4);
+    for (let n = 0; n < walls; n++) {
+      const horiz = rng() < 0.5;
+      const len = 5 + Math.floor(rng() * 10);
+      const sx = p.x0 + Math.floor(rng() * 14), sz = p.z0 + Math.floor(rng() * 14);
+      const hgt = 3 + Math.floor(rng() * 6);
+      for (let i = 0; i < len; i++) {
+        const x = horiz ? sx + i : sx, z = horiz ? sz : sz + i;
+        const ground = terrainHeight(x, z);
+        const colH = Math.max(1, Math.round(hgt * (0.4 + 0.6 * hash3(x, n, z))));
+        for (let y = ground + 1; y <= ground + colH; y++) S(x, y, z, hash3(x, y, z) < 0.3 ? M.MOSSY : M.COBBLE);
       }
-    };
-    pyramid(97, 102, 23);
-    pyramid(86, 108, 9);
-    for (let n = 0; n < 9; n++) {
-      const x = ri(86, 125), z = ri(101, 125);
-      if (grid[idx(x, g, z)]) continue;
-      const hgt = ri(2, 4);
-      fill(x, x, g, g + hgt, z, z, M.CACTUS);
-      if (hgt > 2) { S(x + 1, g + 2, z, M.CACTUS); S(x + 1, g + 3, z, M.CACTUS); }
     }
-  }
-
-  // ---------------- TNT pyramid near spawn ----------------
-  {
-    const [x0, z0] = [60, 60];
-    for (let i = 0; i < 4; i++) fill(x0 + i, x0 + 6 - i, g + i, g + i, z0 + i, z0 + 6 - i, M.TNT);
-  }
-
-  // ---------------- Lake dock ----------------
-  {
-    fill(27, 29, WATER_LEVEL + 1, WATER_LEVEL + 1, 34, 47, M.PLANKS);
-    for (let z = 34; z <= 46; z += 4) {
-      for (const x of [27, 29]) for (let y = groundAt(x, z) + 1; y <= WATER_LEVEL; y++) S(x, y, z, M.WOOD);
+    // Pillars
+    for (let n = 0; n < 4; n++) {
+      const x = p.x0 + 2 + Math.floor(rng() * 18), z = p.z0 + 2 + Math.floor(rng() * 18);
+      const ground = terrainHeight(x, z);
+      const hgt = 4 + Math.floor(rng() * 8);
+      for (let y = ground + 1; y <= ground + hgt; y++) S(x, y, z, M.STONE);
     }
-  }
+  },
 
-  // ---------------- Trees ----------------
-  function plantTree(x, z, kind) {
-    let base = 0;
-    for (let y = H - 1; y > 0; y--) if (grid[idx(x, y, z)]) { base = y + 1; break; }
-    if (kind === 'pine') {
-      const trunk = ri(6, 9);
-      fill(x, x, base, base + trunk - 1, z, z, M.WOOD);
-      for (let i = 0; i < trunk + 1; i++) {
-        const yy = base + 2 + i;
-        const rad = Math.max(0, Math.round((trunk - i) * 0.4));
-        for (let dz = -rad; dz <= rad; dz++)
-          for (let dx = -rad; dx <= rad; dx++)
-            if (dx * dx + dz * dz <= rad * rad + 1 && !(dx === 0 && dz === 0 && i < trunk - 1) && !get(x + dx, yy, z + dz))
-              S(x + dx, yy, z + dz, M.PINE);
-      }
-      S(x, base + trunk + 2, z, M.PINE);
-    } else {
-      const trunk = ri(4, 6);
-      fill(x, x, base, base + trunk - 1, z, z, M.WOOD);
-      const cy = base + trunk;
-      for (let dy = -2; dy <= 2; dy++)
-        for (let dz = -3; dz <= 3; dz++)
-          for (let dx = -3; dx <= 3; dx++) {
-            const dd = dx * dx + dy * dy * 1.6 + dz * dz;
-            if (dd <= 7.5 + rng() * 2 && !get(x + dx, cy + dy, z + dz)) S(x + dx, cy + dy, z + dz, M.LEAVES);
-          }
+  tnt({ S, fill }, p, rng) {
+    const g = p.base + 1;
+    for (let i = 0; i < 4; i++) fill(p.x0 + 3 + i, p.x0 + 9 - i, g + i, g + i, p.z0 + 3 + i, p.z0 + 9 - i, M.TNT);
+    for (let n = 0; n < 6; n++) {
+      const x = p.x0 + Math.floor(rng() * 14), z = p.z0 + Math.floor(rng() * 14);
+      const stack = 1 + Math.floor(rng() * 3);
+      for (let y = g; y < g + stack; y++) S(x, y, z, M.TNT);
     }
-  }
-  for (let n = 0; n < 420; n++) {
-    const x = ri(3, W - 4), z = ri(3, D - 4);
-    let blocked = false;
-    for (const key in REGIONS) if (inRect(x, z, REGIONS[key], 3)) blocked = true;
-    if (blocked) continue;
-    const h = groundAt(x, z);
-    const top = surfaceMat[x + z * W];
-    if (top !== M.GRASS && !(top === M.STONE && h < 26)) continue;
-    if (h <= WATER_LEVEL + 1) continue;
-    if (Math.hypot(x - 62, z - 52) < 8) continue; // keep spawn clear
-    const pineZone = h > 14 || x > 76;
-    if (rng() < 0.55) plantTree(x, z, pineZone || rng() < 0.25 ? 'pine' : 'oak');
-  }
+  },
+};
 
-  markAllDirty();
-
-  // Spawn: open field between castle, city and village, facing the castle gate
-  const sx = 63, sz = 54;
-  return { x: sx + 0.5, y: groundAt(sx, sz) + 1, z: sz + 0.5, yaw: 0 };
+export function spawnPoint() {
+  const x = 24, z = 58;
+  return { x: x + 0.5, y: terrainHeight(x, z) + 1, z: z + 0.5, yaw: 0 };
 }

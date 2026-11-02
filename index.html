@@ -32,10 +32,11 @@
     }
     #stats { top: 12px; left: 12px; }
     #stats b { color: var(--accent); font-variant-numeric: tabular-nums; }
+    #stats .coords { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
     #tool-info { top: 12px; right: 12px; text-align: right; }
     #tool-name { font-weight: 700; font-size: 15px; }
     #tool-desc { color: var(--muted); }
-    #fly { top: 64px; left: 12px; color: #7fd4ff; font-weight: 600; }
+    #fly { top: 86px; left: 12px; color: #7fd4ff; font-weight: 600; }
 
     #crosshair {
       position: fixed; left: 50%; top: 50%; width: 22px; height: 22px;
@@ -111,7 +112,8 @@
 
   <div id="stats" class="hud">
     Destroyed: <b id="destroyed">0</b><br />
-    Voxels left: <b id="remaining">0</b>
+    Biome: <b id="biome">–</b><br />
+    <span id="coords" class="coords">0, 0, 0</span>
   </div>
   <div id="fly" class="hud hidden">✈ Fly mode</div>
   <div id="tool-info" class="hud">
@@ -123,7 +125,7 @@
   <div id="overlay">
     <div class="card">
       <h1>VOXEL <span>DESTRUCTION</span></h1>
-      <p>Wreck the castle, flatten the city, nuke the pyramids.</p>
+      <p>An endless procedurally generated world. Wreck castles, flatten cities, nuke pyramids.</p>
       <button id="play">Click to play</button>
       <div class="controls">
         <kbd>W A S D</kbd><span>Move (<kbd>Shift</kbd> to sprint)</span>
@@ -132,7 +134,7 @@
         <kbd>1 – 7</kbd><span>Switch tool (or mouse wheel)</span>
         <kbd>Space</kbd><span>Jump / swim up</span>
         <kbd>F</kbd><span>Toggle fly mode (<kbd>Space</kbd> up, <kbd>C</kbd> down)</span>
-        <kbd>R</kbd><span>Generate a fresh world</span>
+        <kbd>R</kbd><span>New world (new random seed)</span>
         <kbd>Esc</kbd><span>Release the mouse</span>
       </div>
     </div>
