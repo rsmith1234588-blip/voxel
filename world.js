@@ -14,7 +14,7 @@ export const M = {
   AIR: 0, BEDROCK: 1, DIRT: 2, GRASS: 3, STONE: 4, BRICK: 5, WOOD: 6, GLASS: 7, ROOF: 8,
   LEAVES: 9, SAND: 10, SNOW: 11, WATER: 12, CONCRETE: 13, ASPHALT: 14, PLANKS: 15,
   SANDSTONE: 16, GOLD: 17, TNT: 18, COBBLE: 19, PINE: 20, CACTUS: 21, METAL: 22, DARKCON: 23, CLOTH: 24,
-  BIRCH: 25, AUTUMN: 26, MOSSY: 27,
+  BIRCH: 25, AUTUMN: 26, MOSSY: 27, ICE: 28,
 };
 
 export const MAT_HEX = [];
@@ -46,10 +46,11 @@ MAT_HEX[M.CLOTH] = 0xc8202a;
 MAT_HEX[M.BIRCH] = 0xe6e2d6;
 MAT_HEX[M.AUTUMN] = 0xd9772a;
 MAT_HEX[M.MOSSY] = 0x6f7f5e;
+MAT_HEX[M.ICE] = 0xbfe8f7;
 
 const MAT_LIN = MAT_HEX.map((h) => new THREE.Color(h)); // linear-space colours for vertex colours
 const CHAR = new THREE.Color(0x15110d);
-const FLAT_SHADE = new Set([M.GLASS, M.WATER, M.GOLD, M.TNT]);
+const FLAT_SHADE = new Set([M.GLASS, M.WATER, M.GOLD, M.TNT, M.ICE]);
 
 // ============================================================================
 // Chunk column storage

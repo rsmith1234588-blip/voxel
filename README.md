@@ -18,24 +18,52 @@ Then go to http://localhost:8000. You need a desktop browser, because the game u
 | ----- | ------ |
 | WASD | Move (hold Shift to sprint) |
 | Mouse | Look around |
-| Click | Use the current tool (hold it for auto-fire or the laser) |
-| 1–7 / mouse wheel | Switch tool |
+| Click | Use the current tool (hold it for auto-fire and beams) |
+| Right-click | Detonate all placed C4, or light the TNT you're looking at while holding the TNT Placer |
+| 1–9 / mouse wheel | Switch hotbar slot |
+| E | Open the inventory |
 | Space | Jump, or swim up in water |
 | F | Toggle fly mode (Space goes up, C goes down) |
 | R | Generate a new world |
 | Esc | Release the mouse |
 
+## Inventory
+
+Press **E** to see all 21 tools. There are three ways to put a tool in your 9-slot hotbar:
+
+- Click a tool to put it in the highlighted slot.
+- Drag a tool onto any slot.
+- Hover over a tool and press 1–9.
+
+If the tool is already in another slot, the two slots swap. Your hotbar is saved in your browser.
+
 ## Tools
 
-| Key | Tool | What it does |
-| --- | ---- | ------------ |
-| 1 | 🔨 Hammer | Smashes the blocks in front of you |
-| 2 | ⚡ Laser | A continuous beam that burns through anything while you hold the button |
-| 3 | 🚀 Rocket | Fires straight at the crosshair and explodes on impact |
-| 4 | 💣 Bomb | Thrown in an arc and explodes on impact |
-| 5 | 🎆 Cluster Bomb | Bursts into a ring of bomblets |
-| 6 | 🕳️ Black Hole | Pulls in and swallows blocks, debris and you, then collapses |
-| 7 | ☢️ NUKE | Calls a missile down on the crosshair: a huge crater, shockwave and mushroom cloud |
+| Category | Tool | What it does |
+| -------- | ---- | ------------ |
+| Hand tools | 🔨 Hammer | Smashes the blocks in front of you |
+| | 🧨 TNT Placer | Places TNT blocks. Right-click a TNT block to light it |
+| | ✋ Force Push | Blasts everything in a cone in front of you away |
+| Guns & beams | 🔫 Minigun | Hold the button for rapid fire that chews through blocks |
+| | 💥 Shotgun | Fires a wide spray of 12 pellets |
+| | ⚡ Laser | A continuous beam that burns through anything |
+| | ❄️ Freeze Ray | Turns blocks (and lakes) into ice, which shatters easily when hit |
+| | 🔥 Flamethrower | Sets things on fire. Wood, leaves and grass burn, and the fire spreads |
+| Explosives | 🚀 Rocket | Fires straight at the crosshair and explodes on impact |
+| | 🍍 Grenade | Bounces around, then explodes after 2 seconds |
+| | 💣 Bomb | Thrown in an arc and explodes on impact |
+| | 🎆 Cluster Bomb | Bursts into a ring of bomblets |
+| | 📦 C4 | Sticks to surfaces. Place as many as you like, then right-click to set them all off |
+| | ⛏️ Drill Missile | Bores a long tunnel, then explodes |
+| Strikes | ☢️ NUKE | Calls a missile down on the crosshair: a huge crater, shockwave and mushroom cloud |
+| | ✈️ Airstrike | A bomber carpet-bombs along the direction you're looking |
+| | ☄️ Meteor Shower | Rains flaming meteors around the crosshair |
+| | 🌩️ Lightning | Strikes the crosshair and starts fires |
+| Disasters | 🕳️ Black Hole | Pulls in and swallows blocks, debris and you, then collapses |
+| | 🌪️ Tornado | A wandering twister that rips up trees and buildings and flings the debris |
+| | 🏚️ Earthquake | Splits the ground open and crumbles nearby buildings |
+
+Explosions can set nearby trees on fire. Any TNT caught in a blast, a fire or a disaster goes off too.
 
 ## World
 
