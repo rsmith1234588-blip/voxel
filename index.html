@@ -2,11 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Voxel Destruction</title>
   <style>
     :root {
-      --panel: rgba(16, 18, 24, 0.78);
+      --panel: rgba(14, 16, 22, 0.72);
       --panel-border: rgba(255, 255, 255, 0.12);
       --text: #f2f2f2;
       --muted: #a8adb8;
@@ -16,93 +16,128 @@
     * { box-sizing: border-box; }
     html, body {
       margin: 0; height: 100%; overflow: hidden;
-      background: #8fb8e0; color: var(--text);
+      background: #9cc4ea; color: var(--text);
       font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       user-select: none; -webkit-user-select: none;
-      touch-action: none;
     }
     #app { position: fixed; inset: 0; }
     #app canvas { display: block; }
+    .hidden { display: none !important; }
 
     .hud {
-      position: fixed; padding: 10px 14px; border-radius: 10px;
+      position: fixed; padding: 9px 13px; border-radius: 10px;
       background: var(--panel); border: 1px solid var(--panel-border);
       backdrop-filter: blur(6px); font-size: 13px; line-height: 1.5;
       pointer-events: none;
     }
     #stats { top: 12px; left: 12px; }
     #stats b { color: var(--accent); font-variant-numeric: tabular-nums; }
-    #help { top: 12px; right: 12px; color: var(--muted); text-align: right; }
-    #help kbd {
-      font-family: inherit; font-size: 11px; color: var(--text);
-      background: rgba(255,255,255,0.12); border-radius: 4px; padding: 0 5px;
-    }
+    #tool-info { top: 12px; right: 12px; text-align: right; }
+    #tool-name { font-weight: 700; font-size: 15px; }
+    #tool-desc { color: var(--muted); }
+    #fly { top: 64px; left: 12px; color: #7fd4ff; font-weight: 600; }
 
-    #toolbar {
-      position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
-      display: flex; gap: 8px; padding: 8px; border-radius: 14px;
+    #crosshair {
+      position: fixed; left: 50%; top: 50%; width: 22px; height: 22px;
+      transform: translate(-50%, -50%); pointer-events: none;
+    }
+    #crosshair::before, #crosshair::after {
+      content: ""; position: absolute; background: rgba(255,255,255,0.9);
+      box-shadow: 0 0 2px rgba(0,0,0,0.8);
+    }
+    #crosshair::before { left: 10px; top: 2px; width: 2px; height: 18px; }
+    #crosshair::after { top: 10px; left: 2px; height: 2px; width: 18px; }
+
+    #hotbar {
+      position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+      display: flex; gap: 6px; padding: 7px; border-radius: 14px;
       background: var(--panel); border: 1px solid var(--panel-border);
       backdrop-filter: blur(6px);
     }
-    .tool {
-      position: relative; width: 86px; padding: 8px 6px 6px; border-radius: 10px;
+    .slot {
+      position: relative; width: 74px; padding: 7px 4px 5px; border-radius: 10px;
       border: 2px solid transparent; background: rgba(255,255,255,0.06);
       color: var(--text); cursor: pointer; font: inherit; text-align: center;
-      transition: background 0.15s, border-color 0.15s, transform 0.1s;
     }
-    .tool:hover { background: rgba(255,255,255,0.12); }
-    .tool:active { transform: scale(0.96); }
-    .tool .icon { font-size: 28px; line-height: 1.1; display: block; }
-    .tool .label { font-size: 12px; font-weight: 600; letter-spacing: 0.03em; }
-    .tool .key {
-      position: absolute; top: 4px; left: 6px; font-size: 10px; color: var(--muted);
-    }
-    .tool.active { border-color: var(--accent); background: rgba(255,176,32,0.16); }
-    .tool[data-tool="nuke"].active { border-color: var(--nuke); background: rgba(198,255,61,0.14); }
-    .tool[data-tool="nuke"] .label { color: var(--nuke); }
-    .tool.reset { width: 64px; }
+    .slot .icon { font-size: 24px; line-height: 1.15; display: block; }
+    .slot .label { font-size: 11px; font-weight: 600; white-space: nowrap; }
+    .slot .key { position: absolute; top: 3px; left: 6px; font-size: 10px; color: var(--muted); }
+    .slot.active { border-color: var(--accent); background: rgba(255,176,32,0.16); }
+    .slot[data-tool="nuke"] .label { color: var(--nuke); }
+    .slot[data-tool="nuke"].active { border-color: var(--nuke); background: rgba(198,255,61,0.14); }
 
-    #flash {
-      position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none;
-    }
+    #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+    #water { position: fixed; inset: 0; background: rgba(30, 90, 170, 0.45); pointer-events: none; }
 
-    @media (max-width: 560px) {
-      #help { display: none; }
-      .tool { width: 68px; }
-      .tool .icon { font-size: 24px; }
-      .tool.reset { width: 52px; }
+    #overlay, #loading {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: rgba(8, 10, 16, 0.55); backdrop-filter: blur(3px);
+    }
+    .card {
+      width: min(520px, calc(100vw - 32px)); padding: 28px 30px; border-radius: 16px;
+      background: rgba(14, 16, 22, 0.88); border: 1px solid var(--panel-border);
+      text-align: center;
+    }
+    .card h1 { margin: 0 0 4px; font-size: 30px; letter-spacing: 0.04em; }
+    .card h1 span { color: var(--accent); }
+    .card p { margin: 0 0 18px; color: var(--muted); }
+    #play {
+      font: inherit; font-size: 17px; font-weight: 700; padding: 12px 34px; border-radius: 10px;
+      border: none; background: var(--accent); color: #1a1205; cursor: pointer;
+    }
+    #play:hover { filter: brightness(1.1); }
+    .controls {
+      display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 22px 0 0;
+      text-align: left; font-size: 13px; color: var(--muted);
+    }
+    .controls kbd {
+      font-family: inherit; font-size: 12px; color: var(--text); white-space: nowrap;
+      background: rgba(255,255,255,0.12); border-radius: 4px; padding: 1px 6px;
     }
   </style>
   <script type="importmap">
     {
       "imports": {
-        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
       }
     }
   </script>
 </head>
 <body>
   <div id="app"></div>
+  <div id="water" class="hidden"></div>
   <div id="flash"></div>
+  <div id="crosshair"></div>
 
   <div id="stats" class="hud">
     Destroyed: <b id="destroyed">0</b><br />
     Voxels left: <b id="remaining">0</b>
   </div>
-
-  <div id="help" class="hud">
-    <kbd>Click</kbd> use tool<br />
-    <kbd>Drag</kbd> orbit · <kbd>Right-drag</kbd> pan · <kbd>Scroll</kbd> zoom<br />
-    <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> switch tool · <kbd>R</kbd> rebuild map
+  <div id="fly" class="hud hidden">✈ Fly mode</div>
+  <div id="tool-info" class="hud">
+    <div id="tool-name">Hammer</div>
+    <div id="tool-desc"></div>
   </div>
+  <div id="hotbar"></div>
 
-  <div id="toolbar">
-    <button class="tool active" data-tool="hammer"><span class="key">1</span><span class="icon">🔨</span><span class="label">Hammer</span></button>
-    <button class="tool" data-tool="bomb"><span class="key">2</span><span class="icon">💣</span><span class="label">Bomb</span></button>
-    <button class="tool" data-tool="nuke"><span class="key">3</span><span class="icon">☢️</span><span class="label">NUKE</span></button>
-    <button class="tool reset" id="reset"><span class="key">R</span><span class="icon">↺</span><span class="label">Reset</span></button>
+  <div id="overlay">
+    <div class="card">
+      <h1>VOXEL <span>DESTRUCTION</span></h1>
+      <p>Wreck the castle, flatten the city, nuke the pyramids.</p>
+      <button id="play">Click to play</button>
+      <div class="controls">
+        <kbd>W A S D</kbd><span>Move (<kbd>Shift</kbd> to sprint)</span>
+        <kbd>Mouse</kbd><span>Look around</span>
+        <kbd>Click</kbd><span>Use tool (hold for auto-fire / laser)</span>
+        <kbd>1 – 7</kbd><span>Switch tool (or mouse wheel)</span>
+        <kbd>Space</kbd><span>Jump / swim up</span>
+        <kbd>F</kbd><span>Toggle fly mode (<kbd>Space</kbd> up, <kbd>C</kbd> down)</span>
+        <kbd>R</kbd><span>Generate a fresh world</span>
+        <kbd>Esc</kbd><span>Release the mouse</span>
+      </div>
+    </div>
   </div>
+  <div id="loading"><div class="card"><h1>Building world…</h1></div></div>
 
   <script type="module" src="./main.js"></script>
 </body>
