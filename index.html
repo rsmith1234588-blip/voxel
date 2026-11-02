@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Voxel Destruction</title>
+  <style>
+    :root {
+      --panel: rgba(16, 18, 24, 0.78);
+      --panel-border: rgba(255, 255, 255, 0.12);
+      --text: #f2f2f2;
+      --muted: #a8adb8;
+      --accent: #ffb020;
+      --nuke: #c6ff3d;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden;
+      background: #8fb8e0; color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      user-select: none; -webkit-user-select: none;
+      touch-action: none;
+    }
+    #app { position: fixed; inset: 0; }
+    #app canvas { display: block; }
+
+    .hud {
+      position: fixed; padding: 10px 14px; border-radius: 10px;
+      background: var(--panel); border: 1px solid var(--panel-border);
+      backdrop-filter: blur(6px); font-size: 13px; line-height: 1.5;
+      pointer-events: none;
+    }
+    #stats { top: 12px; left: 12px; }
+    #stats b { color: var(--accent); font-variant-numeric: tabular-nums; }
+    #help { top: 12px; right: 12px; color: var(--muted); text-align: right; }
+    #help kbd {
+      font-family: inherit; font-size: 11px; color: var(--text);
+      background: rgba(255,255,255,0.12); border-radius: 4px; padding: 0 5px;
+    }
+
+    #toolbar {
+      position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+      display: flex; gap: 8px; padding: 8px; border-radius: 14px;
+      background: var(--panel); border: 1px solid var(--panel-border);
+      backdrop-filter: blur(6px);
+    }
+    .tool {
+      position: relative; width: 86px; padding: 8px 6px 6px; border-radius: 10px;
+      border: 2px solid transparent; background: rgba(255,255,255,0.06);
+      color: var(--text); cursor: pointer; font: inherit; text-align: center;
+      transition: background 0.15s, border-color 0.15s, transform 0.1s;
+    }
+    .tool:hover { background: rgba(255,255,255,0.12); }
+    .tool:active { transform: scale(0.96); }
+    .tool .icon { font-size: 28px; line-height: 1.1; display: block; }
+    .tool .label { font-size: 12px; font-weight: 600; letter-spacing: 0.03em; }
+    .tool .key {
+      position: absolute; top: 4px; left: 6px; font-size: 10px; color: var(--muted);
+    }
+    .tool.active { border-color: var(--accent); background: rgba(255,176,32,0.16); }
+    .tool[data-tool="nuke"].active { border-color: var(--nuke); background: rgba(198,255,61,0.14); }
+    .tool[data-tool="nuke"] .label { color: var(--nuke); }
+    .tool.reset { width: 64px; }
+
+    #flash {
+      position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none;
+    }
+
+    @media (max-width: 560px) {
+      #help { display: none; }
+      .tool { width: 68px; }
+      .tool .icon { font-size: 24px; }
+      .tool.reset { width: 52px; }
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="flash"></div>
+
+  <div id="stats" class="hud">
+    Destroyed: <b id="destroyed">0</b><br />
+    Voxels left: <b id="remaining">0</b>
+  </div>
+
+  <div id="help" class="hud">
+    <kbd>Click</kbd> use tool<br />
+    <kbd>Drag</kbd> orbit · <kbd>Right-drag</kbd> pan · <kbd>Scroll</kbd> zoom<br />
+    <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> switch tool · <kbd>R</kbd> rebuild map
+  </div>
+
+  <div id="toolbar">
+    <button class="tool active" data-tool="hammer"><span class="key">1</span><span class="icon">🔨</span><span class="label">Hammer</span></button>
+    <button class="tool" data-tool="bomb"><span class="key">2</span><span class="icon">💣</span><span class="label">Bomb</span></button>
+    <button class="tool" data-tool="nuke"><span class="key">3</span><span class="icon">☢️</span><span class="label">NUKE</span></button>
+    <button class="tool reset" id="reset"><span class="key">R</span><span class="icon">↺</span><span class="label">Reset</span></button>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
