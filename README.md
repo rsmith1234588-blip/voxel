@@ -14,7 +14,7 @@ Then go to http://localhost:8000. You need a desktop browser, because the game u
 
 ## Non-voxel mode
 
-Open `non-voxel.html` (or `/non-voxel` on the live site) for the same game without the cubes. The world, tools, physics and collapse all work exactly the same, but everything is drawn as smooth surfaces: rolling hills instead of terraces, round craters, rounded castles, see-through water, and broken material flies off as jagged rocks instead of cubes.
+Open `non-voxel.html` (or `/non-voxel` on the live site) for the same game without the cubes. The world, tools, physics and collapse all work exactly the same, but everything is drawn as smooth surfaces: rolling hills instead of terraces, round craters, rounded castles and jagged rock debris instead of cubes. Surfaces get procedural textures with bump detail (grass, rock strata, brick, cut-stone castle blocks, wood grain), lakes are a rippling translucent sheet with natural shorelines, and the sky has drifting clouds.
 
 ## Controls
 

@@ -6,7 +6,7 @@ import {
   MeshBuilder, buildSectionGeometry, loadColumn, unloadColumn, getColumn,
   resetWorld as resetWorldData, spawnPoint,
 } from './world.js';
-import { buildSmoothSection, buildSmoothBody, rockGeometry } from './smooth.js';
+import { buildSmoothSection, buildSmoothBody, rockGeometry, createSmoothMaterials } from './smooth.js';
 
 // non-voxel.html sets <html data-render="smooth">: same world and tools, smooth surfaces
 const SMOOTH = document.documentElement.dataset.render === 'smooth';
@@ -60,6 +60,50 @@ sun.shadow.bias = -0.0004;
 sun.shadow.normalBias = 0.04;
 scene.add(sun, sun.target);
 
+// Non-voxel mode: gradient sky with drifting clouds and a sun glow, following the camera
+let skyDome = null;
+if (SMOOTH) {
+  skyDome = new THREE.Mesh(
+    new THREE.SphereGeometry(450, 32, 16),
+    new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, fog: false,
+      uniforms: {
+        uTime: { value: 0 },
+        uSun: { value: SUN_OFFSET.clone().normalize() },
+        uHorizon: { value: SKY.clone() },
+        uZenith: { value: new THREE.Color(0x3f7fd6) },
+      },
+      vertexShader: `varying vec3 vDir; void main() { vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `
+        uniform float uTime; uniform vec3 uSun, uHorizon, uZenith; varying vec3 vDir;
+        float h(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+        float n(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+          return mix(mix(h(i), h(i + vec2(1, 0)), f.x), mix(h(i + vec2(0, 1)), h(i + vec2(1, 1)), f.x), f.y); }
+        float fbm(vec2 p) { float v = 0.0, a = 0.5; for (int i = 0; i < 5; i++) { v += n(p) * a; p *= 2.03; a *= 0.5; } return v; }
+        void main() {
+          vec3 d = normalize(vDir);
+          float up = max(d.y, 0.0);
+          vec3 col = mix(uHorizon, uZenith, pow(up, 0.55));
+          float s = max(dot(d, uSun), 0.0);
+          col += vec3(1.0, 0.92, 0.75) * (pow(s, 600.0) * 4.0 + pow(s, 12.0) * 0.25);
+          if (d.y > 0.0) {
+            vec2 uv = d.xz / (d.y + 0.12) * 1.6 + vec2(uTime * 0.012, uTime * 0.005);
+            float c = smoothstep(0.5, 0.78, fbm(uv));
+            float shade = 0.82 + 0.18 * smoothstep(0.5, 0.9, fbm(uv + 0.3));
+            col = mix(col, vec3(shade), c * 0.85 * smoothstep(0.0, 0.18, d.y));
+          }
+          col = mix(col, uHorizon, smoothstep(0.08, -0.05, d.y));
+          gl_FragColor = vec4(col, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }`,
+    }),
+  );
+  skyDome.renderOrder = -1;
+  skyDome.frustumCulled = false;
+  scene.add(skyDome);
+}
+
 const blastLight = new THREE.PointLight(0xffa040, 0, 0, 2);
 scene.add(blastLight);
 const laserLight = new THREE.PointLight(0xff3020, 0, 12, 2);
@@ -69,10 +113,9 @@ scene.add(laserLight);
 // ============================================================================
 // Chunk streaming & section meshes
 // ============================================================================
-const chunkMat = new THREE.MeshLambertMaterial({ vertexColors: true });
-const waterMat = new THREE.MeshPhongMaterial({
-  color: 0x3a86d0, specular: 0x9fc8ff, shininess: 80, transparent: true, opacity: 0.72, depthWrite: false,
-});
+const smoothMats = SMOOTH ? createSmoothMaterials() : null;
+const chunkMat = SMOOTH ? smoothMats.solid : new THREE.MeshLambertMaterial({ vertexColors: true });
+const waterMat = SMOOTH ? smoothMats.water : null;
 const sectionMeshes = new Map();
 const waterMeshes = new Map();
 const activeColumns = new Set();
@@ -2607,6 +2650,8 @@ function render() {
 
 function frame() {
   update(Math.min(clock.getDelta(), 1 / 20));
+  if (smoothMats) smoothMats.tick(clock.elapsedTime);
+  if (skyDome) { skyDome.position.copy(camera.position); skyDome.material.uniforms.uTime.value = clock.elapsedTime; }
   render();
   requestAnimationFrame(frame);
 }
