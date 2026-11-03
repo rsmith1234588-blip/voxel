@@ -12,6 +12,10 @@ python3 -m http.server 8000
 
 Then go to http://localhost:8000. You need a desktop browser, because the game uses mouse pointer lock.
 
+## Non-voxel mode
+
+Open `non-voxel.html` (or `/non-voxel` on the live site) for the same game without the cubes. The world, tools, physics and collapse all work exactly the same, but everything is drawn as smooth surfaces: rolling hills instead of terraces, round craters, rounded castles, see-through water, and broken material flies off as jagged rocks instead of cubes.
+
 ## Controls
 
 | Input | Action |
@@ -86,4 +90,5 @@ You always spawn in front of a castle, with a TNT pyramid on the plaza behind yo
 ## Code layout
 
 - `world.js`: chunk column storage, terrain and biome noise, structure placement, and chunk meshing with face culling and ambient occlusion
+- `smooth.js`: the non-voxel renderer. It turns the same block data into smooth surfaces (Surface Nets over a blurred solid field)
 - `main.js`: chunk streaming, rendering, player physics, tools, explosions, collapse, effects, audio and HUD

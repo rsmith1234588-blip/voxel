@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en" data-render="smooth">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Smooth Destruction</title>
+  <style>
+    :root {
+      --panel: rgba(14, 16, 22, 0.72);
+      --panel-border: rgba(255, 255, 255, 0.12);
+      --text: #f2f2f2;
+      --muted: #a8adb8;
+      --accent: #ffb020;
+      --nuke: #c6ff3d;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden;
+      background: #9cc4ea; color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      user-select: none; -webkit-user-select: none;
+    }
+    #app { position: fixed; inset: 0; }
+    #app canvas { display: block; }
+    .hidden { display: none !important; }
+
+    .hud {
+      position: fixed; padding: 9px 13px; border-radius: 10px;
+      background: var(--panel); border: 1px solid var(--panel-border);
+      backdrop-filter: blur(6px); font-size: 13px; line-height: 1.5;
+      pointer-events: none;
+    }
+    #stats { top: 12px; left: 12px; }
+    #stats b { color: var(--accent); font-variant-numeric: tabular-nums; }
+    #stats .coords { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    #tool-info { top: 12px; right: 12px; text-align: right; }
+    #tool-name { font-weight: 700; font-size: 15px; }
+    #tool-desc { color: var(--muted); }
+    #fly { top: 86px; left: 12px; color: #7fd4ff; font-weight: 600; }
+
+    #crosshair {
+      position: fixed; left: 50%; top: 50%; width: 22px; height: 22px;
+      transform: translate(-50%, -50%); pointer-events: none;
+    }
+    #crosshair::before, #crosshair::after {
+      content: ""; position: absolute; background: rgba(255,255,255,0.9);
+      box-shadow: 0 0 2px rgba(0,0,0,0.8);
+    }
+    #crosshair::before { left: 10px; top: 2px; width: 2px; height: 18px; }
+    #crosshair::after { top: 10px; left: 2px; height: 2px; width: 18px; }
+
+    #hotbar {
+      position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+      display: flex; gap: 6px; padding: 7px; border-radius: 14px;
+      background: var(--panel); border: 1px solid var(--panel-border);
+      backdrop-filter: blur(6px);
+    }
+    .slot {
+      position: relative; width: 70px; padding: 7px 4px 5px; border-radius: 10px;
+      border: 2px solid transparent; background: rgba(255,255,255,0.06);
+      color: var(--text); cursor: pointer; font: inherit; text-align: center;
+    }
+    .slot .icon { font-size: 24px; line-height: 1.15; display: block; }
+    .slot .label { display: block; font-size: 10px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .slot .key { position: absolute; top: 3px; left: 6px; font-size: 10px; color: var(--muted); }
+    .slot.active { border-color: var(--accent); background: rgba(255,176,32,0.16); }
+    .slot[data-tool="nuke"] .label { color: var(--nuke); }
+    .slot[data-tool="nuke"].active { border-color: var(--nuke); background: rgba(198,255,61,0.14); }
+
+    /* Inventory */
+    #inventory {
+      position: fixed; inset: 0; z-index: 5; display: flex; justify-content: center; align-items: flex-start;
+      padding: 20px 16px 110px; background: rgba(8, 10, 16, 0.6); backdrop-filter: blur(4px); overflow-y: auto;
+    }
+    #hotbar { z-index: 6; }
+    .inv-panel {
+      max-height: calc(100vh - 140px); overflow-y: auto;
+      width: min(860px, 100%); padding: 16px 20px; border-radius: 16px;
+      background: rgba(14, 16, 22, 0.92); border: 1px solid var(--panel-border);
+    }
+    .inv-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+    .inv-head h2 { margin: 0; font-size: 22px; letter-spacing: 0.04em; }
+    .inv-head .hint { color: var(--muted); font-size: 12px; }
+    .inv-head kbd { font-family: inherit; font-size: 11px; color: var(--text); background: rgba(255,255,255,0.12); border-radius: 4px; padding: 0 5px; }
+    #inv-close {
+      font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 8px; cursor: pointer;
+      border: 1px solid var(--panel-border); background: rgba(255,255,255,0.08); color: var(--text);
+    }
+    .inv-cat { margin: 12px 0 6px; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .inv-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .inv-tool {
+      width: 88px; padding: 7px 4px 6px; border-radius: 10px; cursor: grab; text-align: center;
+      border: 2px solid transparent; background: rgba(255,255,255,0.06); color: var(--text); font: inherit;
+      transition: background 0.12s, transform 0.08s;
+    }
+    .inv-tool:hover { background: rgba(255,255,255,0.14); transform: translateY(-1px); }
+    .inv-tool .icon { display: block; font-size: 24px; line-height: 1.2; }
+    .inv-tool .label { font-size: 11px; font-weight: 600; }
+    .inv-tool.equipped { border-color: rgba(255,176,32,0.35); }
+    .inv-tool.current { border-color: var(--accent); background: rgba(255,176,32,0.14); }
+    #inv-info { margin-top: 14px; padding: 12px 14px; border-radius: 10px; background: rgba(255,255,255,0.05); min-height: 58px; }
+    #inv-name { font-weight: 700; }
+    #inv-desc { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    body.inv-open .slot { cursor: pointer; }
+    .slot.drop { border-color: #7fd4ff; background: rgba(127,212,255,0.18); }
+    #crosshair, #tool-info { z-index: 1; }
+    body.inv-open #crosshair { display: none; }
+
+    #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+    #water { position: fixed; inset: 0; background: rgba(30, 90, 170, 0.45); pointer-events: none; }
+
+    #overlay, #loading {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: rgba(8, 10, 16, 0.55); backdrop-filter: blur(3px);
+    }
+    .card {
+      width: min(520px, calc(100vw - 32px)); padding: 28px 30px; border-radius: 16px;
+      background: rgba(14, 16, 22, 0.88); border: 1px solid var(--panel-border);
+      text-align: center;
+    }
+    .card h1 { margin: 0 0 4px; font-size: 30px; letter-spacing: 0.04em; }
+    .card h1 span { color: var(--accent); }
+    .card p { margin: 0 0 18px; color: var(--muted); }
+    #play {
+      font: inherit; font-size: 17px; font-weight: 700; padding: 12px 34px; border-radius: 10px;
+      border: none; background: var(--accent); color: #1a1205; cursor: pointer;
+    }
+    #play:hover { filter: brightness(1.1); }
+    .controls {
+      display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 22px 0 0;
+      text-align: left; font-size: 13px; color: var(--muted);
+    }
+    .controls kbd {
+      font-family: inherit; font-size: 12px; color: var(--text); white-space: nowrap;
+      background: rgba(255,255,255,0.12); border-radius: 4px; padding: 1px 6px;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="water" class="hidden"></div>
+  <div id="flash"></div>
+  <div id="crosshair"></div>
+
+  <div id="stats" class="hud">
+    Destroyed: <b id="destroyed">0</b><br />
+    Biome: <b id="biome">–</b><br />
+    <span id="coords" class="coords">0, 0, 0</span>
+  </div>
+  <div id="fly" class="hud hidden">✈ Fly mode</div>
+  <div id="tool-info" class="hud">
+    <div id="tool-name">Hammer</div>
+    <div id="tool-desc"></div>
+  </div>
+  <div id="hotbar"></div>
+
+  <div id="inventory" class="hidden">
+    <div class="inv-panel">
+      <div class="inv-head">
+        <h2>Inventory</h2>
+        <span class="hint">Click a tool to put it in the highlighted slot · drag it onto any slot · hover and press <kbd>1</kbd>–<kbd>9</kbd></span>
+        <button id="inv-close">Close <kbd>E</kbd></button>
+      </div>
+      <div id="inv-grid"></div>
+      <div id="inv-info"><div id="inv-name"></div><div id="inv-desc"></div></div>
+    </div>
+  </div>
+
+  <div id="overlay">
+    <div class="card">
+      <h1>SMOOTH <span>DESTRUCTION</span></h1>
+      <p>No more cubes: smooth hills, round craters and rubble. An endless procedurally generated world. Wreck castles, flatten cities, nuke pyramids.</p>
+      <button id="play">Click to play</button>
+      <div class="controls">
+        <kbd>W A S D</kbd><span>Move (<kbd>Shift</kbd> to sprint)</span>
+        <kbd>Mouse</kbd><span>Look around</span>
+        <kbd>Click</kbd><span>Use tool (hold for auto-fire and beams)</span>
+        <kbd>Right-click</kbd><span>Detonate C4 / light TNT</span>
+        <kbd>1 – 9</kbd><span>Switch hotbar slot (or mouse wheel)</span>
+        <kbd>E</kbd><span>Inventory: all 21 tools</span>
+        <kbd>Space</kbd><span>Jump / swim up</span>
+        <kbd>F</kbd><span>Toggle fly mode (<kbd>Space</kbd> up, <kbd>C</kbd> down)</span>
+        <kbd>R</kbd><span>New world (new random seed)</span>
+        <kbd>Esc</kbd><span>Release the mouse</span>
+      </div>
+    </div>
+  </div>
+  <div id="loading"><div class="card"><h1>Building world…</h1></div></div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
