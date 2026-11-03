@@ -6,10 +6,6 @@ import {
   MeshBuilder, buildSectionGeometry, loadColumn, unloadColumn, getColumn,
   resetWorld as resetWorldData, spawnPoint,
 } from './world.js';
-import { buildSmoothSection, buildSmoothBody, rockGeometry, createSmoothMaterials } from './smooth.js';
-
-// non-voxel.html sets <html data-render="smooth">: same world and tools, smooth surfaces
-const SMOOTH = document.documentElement.dataset.render === 'smooth';
 
 const GRAVITY = 28;
 const rand = (a = 1, b) => (b === undefined ? Math.random() * a : a + Math.random() * (b - a));
@@ -60,50 +56,6 @@ sun.shadow.bias = -0.0004;
 sun.shadow.normalBias = 0.04;
 scene.add(sun, sun.target);
 
-// Non-voxel mode: gradient sky with drifting clouds and a sun glow, following the camera
-let skyDome = null;
-if (SMOOTH) {
-  skyDome = new THREE.Mesh(
-    new THREE.SphereGeometry(450, 32, 16),
-    new THREE.ShaderMaterial({
-      side: THREE.BackSide, depthWrite: false, fog: false,
-      uniforms: {
-        uTime: { value: 0 },
-        uSun: { value: SUN_OFFSET.clone().normalize() },
-        uHorizon: { value: SKY.clone() },
-        uZenith: { value: new THREE.Color(0x3f7fd6) },
-      },
-      vertexShader: `varying vec3 vDir; void main() { vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-      fragmentShader: `
-        uniform float uTime; uniform vec3 uSun, uHorizon, uZenith; varying vec3 vDir;
-        float h(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-        float n(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
-          return mix(mix(h(i), h(i + vec2(1, 0)), f.x), mix(h(i + vec2(0, 1)), h(i + vec2(1, 1)), f.x), f.y); }
-        float fbm(vec2 p) { float v = 0.0, a = 0.5; for (int i = 0; i < 5; i++) { v += n(p) * a; p *= 2.03; a *= 0.5; } return v; }
-        void main() {
-          vec3 d = normalize(vDir);
-          float up = max(d.y, 0.0);
-          vec3 col = mix(uHorizon, uZenith, pow(up, 0.55));
-          float s = max(dot(d, uSun), 0.0);
-          col += vec3(1.0, 0.92, 0.75) * (pow(s, 600.0) * 4.0 + pow(s, 12.0) * 0.25);
-          if (d.y > 0.0) {
-            vec2 uv = d.xz / (d.y + 0.12) * 1.6 + vec2(uTime * 0.012, uTime * 0.005);
-            float c = smoothstep(0.5, 0.78, fbm(uv));
-            float shade = 0.82 + 0.18 * smoothstep(0.5, 0.9, fbm(uv + 0.3));
-            col = mix(col, vec3(shade), c * 0.85 * smoothstep(0.0, 0.18, d.y));
-          }
-          col = mix(col, uHorizon, smoothstep(0.08, -0.05, d.y));
-          gl_FragColor = vec4(col, 1.0);
-          #include <tonemapping_fragment>
-          #include <colorspace_fragment>
-        }`,
-    }),
-  );
-  skyDome.renderOrder = -1;
-  skyDome.frustumCulled = false;
-  scene.add(skyDome);
-}
-
 const blastLight = new THREE.PointLight(0xffa040, 0, 0, 2);
 scene.add(blastLight);
 const laserLight = new THREE.PointLight(0xff3020, 0, 12, 2);
@@ -113,45 +65,25 @@ scene.add(laserLight);
 // ============================================================================
 // Chunk streaming & section meshes
 // ============================================================================
-const smoothMats = SMOOTH ? createSmoothMaterials() : null;
-const chunkMat = SMOOTH ? smoothMats.solid : new THREE.MeshLambertMaterial({ vertexColors: true });
-const waterMat = SMOOTH ? smoothMats.water : null;
+const chunkMat = new THREE.MeshLambertMaterial({ vertexColors: true });
 const sectionMeshes = new Map();
-const waterMeshes = new Map();
 const activeColumns = new Set();
 
-function setSectionMesh(map, key, geo, mat, shadows) {
-  let mesh = map.get(key);
+function rebuildSection(key) {
+  const geo = buildSectionGeometry(key);
+  let mesh = sectionMeshes.get(key);
   if (!geo) {
-    if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); map.delete(key); }
+    if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); sectionMeshes.delete(key); }
     return;
   }
   if (mesh) {
     mesh.geometry.dispose();
     mesh.geometry = geo;
   } else {
-    mesh = new THREE.Mesh(geo, mat);
-    mesh.castShadow = shadows;
-    mesh.receiveShadow = true;
-    map.set(key, mesh);
+    mesh = new THREE.Mesh(geo, chunkMat);
+    mesh.castShadow = mesh.receiveShadow = true;
+    sectionMeshes.set(key, mesh);
     scene.add(mesh);
-  }
-}
-
-function rebuildSection(key) {
-  if (SMOOTH) {
-    const { solid, water } = buildSmoothSection(key);
-    setSectionMesh(sectionMeshes, key, solid, chunkMat, true);
-    setSectionMesh(waterMeshes, key, water, waterMat, false);
-  } else {
-    setSectionMesh(sectionMeshes, key, buildSectionGeometry(key), chunkMat, true);
-  }
-}
-
-function dropSection(key) {
-  for (const map of [sectionMeshes, waterMeshes]) {
-    const mesh = map.get(key);
-    if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); map.delete(key); }
   }
 }
 
@@ -192,7 +124,9 @@ function streamChunks(genBudget) {
     if (dx * dx + dz * dz <= drop) continue;
     activeColumns.delete(key);
     for (let cy = 0; cy < H / CS; cy++) {
-      dropSection(key * (H / CS) + cy);
+      const sk = key * (H / CS) + cy;
+      const mesh = sectionMeshes.get(sk);
+      if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); sectionMeshes.delete(sk); }
     }
     unloadColumn(cx, cz);
   }
@@ -296,8 +230,7 @@ function laserSound(on) {
 // Debris (instanced loose cubes)
 // ============================================================================
 const MAX_DEBRIS = 6000;
-const debrisGeo = SMOOTH ? rockGeometry(0.46) : new THREE.BoxGeometry(0.88, 0.88, 0.88);
-const debrisMesh = new THREE.InstancedMesh(debrisGeo, new THREE.MeshLambertMaterial({ flatShading: SMOOTH }), MAX_DEBRIS);
+const debrisMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.88, 0.88, 0.88), new THREE.MeshLambertMaterial(), MAX_DEBRIS);
 debrisMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 debrisMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_DEBRIS * 3), 3);
 debrisMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
@@ -552,7 +485,7 @@ function explode(center, radius, opts = {}) {
         const dx = x + 0.5 - cx, dy = y + 0.5 - cy, dz = z + 0.5 - cz;
         const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
         const ice = mat === M.ICE;
-        if (dist > radius * (ice ? 1.5 : 1) * (SMOOTH ? 0.93 + Math.random() * 0.12 : 0.82 + Math.random() * 0.3)) continue;
+        if (dist > radius * (ice ? 1.5 : 1) * (0.82 + Math.random() * 0.3)) continue;
         if (chance !== undefined && !ice && dist > 0.8 && Math.random() > chance) continue;
 
         if (mat === M.TNT) tntQueue.push({ x: x + 0.5, y: y + 0.5, z: z + 0.5, t: rand(0.12, 0.4) });
@@ -708,14 +641,9 @@ function detachComponent(cells) {
   const setK = new Set();
   for (const v of vox) setK.add(cellKey(v.x, v.y, v.z));
   const occ = (x, y, z) => y >= 0 && y < H && setK.has(cellKey(x, y, z));
-  let geo;
-  if (SMOOTH) geo = buildSmoothBody(vox);
-  else {
-    bodyBuilder.reset();
-    for (const v of vox) bodyBuilder.emit(v.x, v.y, v.z, v.m, v.b, occ);
-    geo = bodyBuilder.toGeometry();
-  }
-  const mesh = new THREE.Mesh(geo || new THREE.BufferGeometry(), chunkMat);
+  bodyBuilder.reset();
+  for (const v of vox) bodyBuilder.emit(v.x, v.y, v.z, v.m, v.b, occ);
+  const mesh = new THREE.Mesh(bodyBuilder.toGeometry(), chunkMat);
   mesh.castShadow = mesh.receiveShadow = true;
   scene.add(mesh);
   const bottoms = vox.filter((v) => !occ(v.x, v.y - 1, v.z));
@@ -2528,7 +2456,8 @@ function clearDynamic() {
 let worldSeed = 0;
 function resetWorld(seed = (Math.random() * 1e9) | 0) {
   clearDynamic();
-  for (const key of [...sectionMeshes.keys(), ...waterMeshes.keys()]) dropSection(key);
+  for (const mesh of sectionMeshes.values()) { scene.remove(mesh); mesh.geometry.dispose(); }
+  sectionMeshes.clear();
   activeColumns.clear();
   worldSeed = seed;
   resetWorldData(seed);
@@ -2650,8 +2579,6 @@ function render() {
 
 function frame() {
   update(Math.min(clock.getDelta(), 1 / 20));
-  if (smoothMats) smoothMats.tick(clock.elapsedTime);
-  if (skyDome) { skyDome.position.copy(camera.position); skyDome.material.uniforms.uTime.value = clock.elapsedTime; }
   render();
   requestAnimationFrame(frame);
 }
