@@ -4,7 +4,7 @@ import {
   get, getBurn, set as setVoxel, addBurn, isLoaded, cellKey, colKey,
   dirtyUrgent, dirtyLoad, decodeSection, voxelColor, biomeAt,
   MeshBuilder, buildSectionGeometry, loadColumn, unloadColumn, getColumn,
-  resetWorld as resetWorldData, spawnPoint, sectionIsAir,
+  resetWorld as resetWorldData, spawnPoint, sectionIsAir, buildColumnLOD,
 } from './world.js';
 
 const GRAVITY = 28;
@@ -36,9 +36,13 @@ document.getElementById('app').appendChild(renderer.domElement);
 const SKY = new THREE.Color(0x9cc4ea);
 const scene = new THREE.Scene();
 scene.background = SKY.clone();
-const VIEW_CHUNKS = TINY ? 12 : 9; // render distance in chunks
+const VIEW_CHUNKS = TINY ? 12 : 9; // live (simulated) distance in chunks
 const VIEW_M = VIEW_CHUNKS * CS * VW; // ...in metres
-scene.fog = new THREE.Fog(SKY.clone(), VIEW_M * (TINY ? 0.55 : 0.45), VIEW_M * 0.95);
+// Tiny mode also remembers chunks you've explored, out to this distance
+const GHOST_CHUNKS = 50;
+const GHOST_M = GHOST_CHUNKS * CS * VW;
+if (TINY) scene.fog = new THREE.Fog(SKY.clone(), VIEW_M * 1.2, GHOST_M * 0.97);
+else scene.fog = new THREE.Fog(SKY.clone(), VIEW_M * 0.45, VIEW_M * 0.95);
 
 const FOV = 75;
 const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.05, 500);
@@ -96,6 +100,101 @@ function rebuildSection(key) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Remembered chunks (tiny mode). When a column leaves the live area, a coarse
+// snapshot of it stays on screen. Nothing is simulated there: it shows the
+// column as it was when you last saw it. Snapshots are merged per region.
+// ---------------------------------------------------------------------------
+const GHOSTS = TINY;
+const LOD_F = 4;              // snapshot block = 4 tiny blocks (40 cm)
+const GHOST_REGION = 8;       // columns per side merged into one mesh
+const ghostCols = new Map();  // colKey -> { rk, geo }
+const ghostRegions = new Map(); // region key -> { cols: Set, mesh, dirty }
+const ghostPending = new Set(); // live again; drop the snapshot once the live meshes exist
+const decodeCol = (key) => [Math.floor(key / 65536) - 32768, (key % 65536) - 32768];
+
+function addGhost(key, geo) {
+  removeGhost(key);
+  if (!geo) return;
+  const [cx, cz] = decodeCol(key);
+  const rk = colKey(Math.floor(cx / GHOST_REGION), Math.floor(cz / GHOST_REGION));
+  ghostCols.set(key, { rk, geo });
+  let r = ghostRegions.get(rk);
+  if (!r) { r = { cols: new Set(), mesh: null, dirty: true }; ghostRegions.set(rk, r); }
+  r.cols.add(key);
+  r.dirty = true;
+}
+
+function removeGhost(key) {
+  const g = ghostCols.get(key);
+  if (!g) return;
+  ghostCols.delete(key);
+  const r = ghostRegions.get(g.rk);
+  if (r) { r.cols.delete(key); r.dirty = true; }
+}
+
+function rebuildGhostRegions(budget) {
+  for (const [rk, r] of ghostRegions) {
+    if (!r.dirty) continue;
+    if (budget-- <= 0) break;
+    r.dirty = false;
+    if (r.mesh) { scene.remove(r.mesh); r.mesh.geometry.dispose(); r.mesh = null; }
+    if (!r.cols.size) { ghostRegions.delete(rk); continue; }
+    let nv = 0, ni = 0;
+    for (const k of r.cols) { const g = ghostCols.get(k).geo; nv += g.attributes.position.count; ni += g.index.count; }
+    const pos = new Float32Array(nv * 3), nor = new Float32Array(nv * 3), col = new Float32Array(nv * 3);
+    const ind = new Uint32Array(ni);
+    let ov = 0, oi = 0;
+    for (const k of r.cols) {
+      const g = ghostCols.get(k).geo;
+      pos.set(g.attributes.position.array, ov * 3);
+      nor.set(g.attributes.normal.array, ov * 3);
+      col.set(g.attributes.color.array, ov * 3);
+      const src = g.index.array;
+      for (let i = 0; i < src.length; i++) ind[oi + i] = src[i] + ov;
+      ov += g.attributes.position.count;
+      oi += src.length;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.setIndex(new THREE.BufferAttribute(ind, 1));
+    geo.computeBoundingSphere();
+    r.mesh = new THREE.Mesh(geo, chunkMat);
+    r.mesh.scale.setScalar(LOD_F * VW);
+    r.mesh.receiveShadow = true;
+    scene.add(r.mesh);
+  }
+}
+
+let ghostTick = 0;
+function updateGhosts(pcx, pcz) {
+  // Hand back to live chunks once all of their sections have been meshed
+  for (const key of ghostPending) {
+    let ready = true;
+    for (let cy = 0; cy < H / CS && ready; cy++) if (dirtyLoad.has(key * (H / CS) + cy)) ready = false;
+    if (ready) { removeGhost(key); ghostPending.delete(key); }
+  }
+  // Forget snapshots that are too far away
+  if (--ghostTick <= 0) {
+    ghostTick = 30;
+    const far = GHOST_CHUNKS * GHOST_CHUNKS;
+    for (const key of ghostCols.keys()) {
+      const [cx, cz] = decodeCol(key);
+      if ((cx - pcx) ** 2 + (cz - pcz) ** 2 > far) removeGhost(key);
+    }
+  }
+  rebuildGhostRegions(2);
+}
+
+function clearGhosts() {
+  for (const r of ghostRegions.values()) if (r.mesh) { scene.remove(r.mesh); r.mesh.geometry.dispose(); }
+  ghostRegions.clear();
+  ghostCols.clear();
+  ghostPending.clear();
+}
+
 const sectionColumnKey = (key) => { const { cx, cz } = decodeSection(key); return colKey(cx, cz); };
 
 function flushSections(loadBudget, urgentBudget = TINY ? 30 : Infinity) {
@@ -132,6 +231,7 @@ function streamChunks(genBudget) {
     if (genBudget-- <= 0 && d2 > 4) break;
     loadColumn(cx, cz);
     activeColumns.add(colKey(cx, cz));
+    if (GHOSTS && ghostCols.has(colKey(cx, cz))) ghostPending.add(colKey(cx, cz));
   }
   const drop = (R + 2) * (R + 2);
   for (const key of activeColumns) {
@@ -139,6 +239,7 @@ function streamChunks(genBudget) {
     const dx = cx - pcx, dz = cz - pcz;
     if (dx * dx + dz * dz <= drop) continue;
     activeColumns.delete(key);
+    if (GHOSTS) { ghostPending.delete(key); addGhost(key, buildColumnLOD(cx, cz, LOD_F)); }
     for (let cy = 0; cy < H / CS; cy++) {
       const sk = key * (H / CS) + cy;
       const mesh = sectionMeshes.get(sk);
@@ -146,6 +247,7 @@ function streamChunks(genBudget) {
     }
     unloadColumn(cx, cz);
   }
+  if (GHOSTS) updateGhosts(pcx, pcz);
   return wanted.length;
 }
 
@@ -2571,7 +2673,7 @@ for (const btn of document.querySelectorAll('#block-size button')) {
   });
 }
 document.getElementById('block-note').textContent = TINY
-  ? '10x smaller blocks · about 19 m view · blasts capped at 6 m'
+  ? '10x smaller blocks · 19 m live area, explored chunks stay visible to 80 m · blasts capped at 6 m'
   : '';
 document.getElementById('inv-close').addEventListener('click', closeInventory);
 canvas.addEventListener('click', () => { if (!locked && !invOpen) requestLock(); });
@@ -2662,6 +2764,7 @@ function resetWorld(seed = (Math.random() * 1e9) | 0) {
   clearDynamic();
   for (const mesh of sectionMeshes.values()) { scene.remove(mesh); mesh.geometry.dispose(); }
   sectionMeshes.clear();
+  clearGhosts();
   activeColumns.clear();
   worldSeed = seed;
   resetWorldData(seed);
@@ -2804,5 +2907,6 @@ window.voxelGame = {
   blast: (x, y, z, r) => explode(new THREE.Vector3(x, y, z), r, { force: 5, debrisChance: 0.3 }),
   get seed() { return worldSeed; },
   get sections() { return sectionMeshes.size; },
+  get ghosts() { return ghostCols.size; },
   get bodies() { return bodies.length; },
 };

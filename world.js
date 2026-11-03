@@ -988,3 +988,59 @@ export function spawnPoint() {
   const y = VS === 1 ? terrainHeight(x, z) + 1 : Math.round((terrainHeightF(x + 0.5, z + 0.5) + 1) * VS) / VS;
   return { x: x + 0.5, y, z: z + 0.5, yaw: 0 };
 }
+
+// ============================================================================
+// Remembered chunks (tiny mode): a coarse snapshot of a column, F cells per block
+// ============================================================================
+const lodBuilder = new MeshBuilder();
+// Returns a geometry in coarse units (scale it by F / VS), or null if empty
+export function buildColumnLOD(cx, cz, F) {
+  const col = getColumn(cx, cz);
+  if (!col) return null;
+  const N = CS / F, NY = Math.ceil(H / F);
+  const PW = N + 2, PH = NY + 2; // padded by one coarse block on every side
+  const mats = new Uint8Array(PW * PW * PH), burns = new Uint8Array(PW * PW * PH);
+  const at = (i, j, k) => i + PW * (k + PW * j); // j = y
+  const X0 = cx * N - 1, Z0 = cz * N - 1;        // coarse origin of the padded box
+  for (let k = 0; k < PW; k++)
+    for (let i = 0; i < PW; i++) {
+      // Sample the centre line of each coarse column
+      const x = (X0 + i) * F + (F >> 1), z = (Z0 + k) * F + (F >> 1);
+      const c = getColumn(x >> 4, z >> 4);
+      const base = (x & 15) + CS * (z & 15);
+      let estTop = -1;
+      if (!c) estTop = Math.round((terrainHeightF((x + 0.5) / VS, (z + 0.5) / VS) + 1) * VS) - 1;
+      for (let j = 0; j < PH; j++) {
+        const Y = j - 1;
+        let m = 0, b = 0;
+        if (Y < 0) m = M.BEDROCK;
+        else if (!c) m = Y * F <= estTop ? M.STONE : 0;
+        else {
+          // The highest solid cell in the block wins, so thin grass/snow tops survive
+          for (let y = Math.min(H - 1, Y * F + F - 1); y >= Y * F; y--) {
+            const v = c.grid[base + CS * CS * y];
+            if (v) { m = v; b = c.burn ? c.burn[base + CS * CS * y] : 0; break; }
+          }
+        }
+        mats[at(i, j, k)] = m; burns[at(i, j, k)] = b;
+      }
+    }
+  const occ = (X, Y, Z) => {
+    const i = X - X0, j = Y + 1, k = Z - Z0;
+    if (j < 0) return true;
+    if (j >= PH || i < 0 || i >= PW || k < 0 || k >= PW) return false;
+    if (!mats[at(i, j, k)]) return false;
+    // Neighbouring columns only hide our side faces when buried, which leaves a
+    // one-block skirt at the surface so snapshots never show gaps against live chunks
+    const inside = i >= 1 && i <= N && k >= 1 && k <= N;
+    return inside || (j + 1 < PH && mats[at(i, j + 1, k)] !== 0);
+  };
+  lodBuilder.reset();
+  for (let j = 1; j < PH - 1; j++)
+    for (let k = 1; k <= N; k++)
+      for (let i = 1; i <= N; i++) {
+        const m = mats[at(i, j, k)];
+        if (m) lodBuilder.emit(X0 + i, j - 1, Z0 + k, m, burns[at(i, j, k)], occ);
+      }
+  return lodBuilder.toGeometry();
+}

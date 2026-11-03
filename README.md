@@ -33,7 +33,8 @@ On the start screen, **Block size** switches between **Normal (1 m)** and **Tiny
 
 In tiny mode every block is 10x smaller (1,000 times as many blocks), so craters, rubble and collapses are far more detailed. The same castles, cities and pyramids are built out of tiny blocks, and hills are smooth slopes instead of 1 m steps. To keep it playable:
 
-- You can only see about 19 m (the normal view is about 140 m), and you start right in front of the castle gate.
+- Only the 19 m around you is live (the normal view is about 140 m), and you start right in front of the castle gate.
+- Chunks you've already explored stay visible out to about 80 m as frozen snapshots (at 40 cm detail). Nothing happens in them: they show each chunk as it was when it left the live area, damage included, and update the next time you walk back.
 - Blasts are capped at a 6 m radius, so the nuke makes a 6 m crater.
 - Only part of the destroyed material flies off as debris.
 - Natural ground never collapses. Structures still do.
