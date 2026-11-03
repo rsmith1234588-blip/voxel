@@ -27,6 +27,18 @@ Then go to http://localhost:8000. You need a desktop browser, because the game u
 | R | Generate a new world |
 | Esc | Release the mouse |
 
+## Block size
+
+On the start screen, **Block size** switches between **Normal (1 m)** and **Tiny (10 cm)**. The setting is saved in your browser, and switching reloads the page with a fresh world.
+
+In tiny mode every block is 10x smaller (1,000 times as many blocks), so craters, rubble and collapses are far more detailed. The same castles, cities and pyramids are built out of tiny blocks, and hills are smooth slopes instead of 1 m steps. To keep it playable:
+
+- You can only see about 19 m (the normal view is about 140 m), and you start right in front of the castle gate.
+- Blasts are capped at a 6 m radius, so the nuke makes a 6 m crater.
+- Only part of the destroyed material flies off as debris.
+- Natural ground never collapses. Structures still do.
+- Big explosions can still cause a short stutter while the crater is rebuilt.
+
 ## Inventory
 
 Press **E** to see all 21 tools. There are three ways to put a tool in your 9-slot hotbar:
@@ -85,5 +97,5 @@ You always spawn in front of a castle, with a TNT pyramid on the plaza behind yo
 
 ## Code layout
 
-- `world.js`: chunk column storage, terrain and biome noise, structure placement, and chunk meshing with face culling and ambient occlusion
+- `world.js`: block size setting (`VS` cells per metre), chunk column storage, terrain and biome noise, structure placement, and chunk meshing with face culling and ambient occlusion
 - `main.js`: chunk streaming, rendering, player physics, tools, explosions, collapse, effects, audio and HUD

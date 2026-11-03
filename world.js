@@ -4,11 +4,17 @@ import * as THREE from 'three';
 // ============================================================================
 // Dimensions & materials
 // ============================================================================
-export const H = 64;           // world height
-export const CS = 16;          // chunk size (x/z) and section height
+// Block size setting: 1 = normal 1 m blocks, 10 = tiny 10 cm blocks (10 per metre).
+// Gameplay positions are always in metres; the block grid is VS cells per metre.
+export const VS = (() => {
+  try { return Number(localStorage.getItem('voxel.scale')) === 10 ? 10 : 1; } catch { return 1; }
+})();
+export const HM = 64;          // world height in metres
+export const H = HM * VS;      // world height in cells
+export const CS = 16;          // chunk size (x/z) and section height, in cells
 export const SECTIONS = H / CS;
-export const WATER_LEVEL = 12;
-export const REGION = 48;      // structure placement grid
+export const WATER_LEVEL = 12; // metres
+export const REGION = 48;      // structure placement grid (metres)
 
 export const M = {
   AIR: 0, BEDROCK: 1, DIRT: 2, GRASS: 3, STONE: 4, BRICK: 5, WOOD: 6, GLASS: 7, ROOF: 8,
@@ -65,13 +71,14 @@ export function decodeSection(key) {
 }
 // Unique numeric key for any world cell (used by collapse flood fills)
 const KOFF = 1 << 20;
-export const cellKey = (x, y, z) => ((x + KOFF) * 2097152 + (z + KOFF)) * 64 + y;
+export const cellKey = (x, y, z) => ((x + KOFF) * 2097152 + (z + KOFF)) * H + y;
 
 class Column {
   constructor(cx, cz) {
     this.cx = cx; this.cz = cz;
     this.grid = new Uint8Array(CS * CS * H);
-    this.burn = new Uint8Array(CS * CS * H);
+    this.burn = null; // allocated on first scorch
+
     this.modified = false;
   }
 }
@@ -95,7 +102,7 @@ export function get(x, y, z) {
 export function getBurn(x, y, z) {
   if (y < 0 || y >= H) return 0;
   const c = getColumn(x >> 4, z >> 4);
-  return c ? c.burn[local(x, y, z)] : 0;
+  return c && c.burn ? c.burn[local(x, y, z)] : 0;
 }
 export function isLoaded(x, z) { return !!getColumn(x >> 4, z >> 4); }
 
@@ -112,25 +119,37 @@ export function markDirty(x, y, z) {
       for (let cx = cx0; cx <= cx1; cx++) dirtyUrgent.add(sectionKey(cx, cy, cz));
 }
 
-export function set(x, y, z, mat, b = 0) {
+// dirty=false skips per-cell remeshing; call markRangeDirty once afterwards (bulk edits)
+export function set(x, y, z, mat, b = 0, dirty = true) {
   if (y < 0 || y >= H) return;
   const c = getColumn(x >> 4, z >> 4);
   if (!c) return;
   const i = local(x, y, z);
   c.grid[i] = mat;
-  c.burn[i] = mat ? b : 0;
+  if (mat && b) {
+    if (!c.burn) c.burn = new Uint8Array(CS * CS * H);
+    c.burn[i] = b;
+  } else if (c.burn) c.burn[i] = 0;
   c.modified = true;
-  markDirty(x, y, z);
+  if (dirty) markDirty(x, y, z);
 }
 
-export function addBurn(x, y, z, amount) {
+export function markRangeDirty(x0, y0, z0, x1, y1, z1) {
+  const cy0 = Math.max(0, (y0 - 1) >> 4), cy1 = Math.min(SECTIONS - 1, (y1 + 1) >> 4);
+  for (let cz = (z0 - 1) >> 4; cz <= (z1 + 1) >> 4; cz++)
+    for (let cx = (x0 - 1) >> 4; cx <= (x1 + 1) >> 4; cx++)
+      for (let cy = cy0; cy <= cy1; cy++) dirtyUrgent.add(sectionKey(cx, cy, cz));
+}
+
+export function addBurn(x, y, z, amount, dirty = true) {
   const c = getColumn(x >> 4, z >> 4);
   if (!c || y < 0 || y >= H) return;
   const i = local(x, y, z);
+  if (!c.burn) c.burn = new Uint8Array(CS * CS * H);
   const v = c.burn[i] + amount;
   c.burn[i] = v > 255 ? 255 : v;
   c.modified = true;
-  markDirty(x, y, z);
+  if (dirty) markDirty(x, y, z);
 }
 
 export function loadColumn(cx, cz) {
@@ -205,10 +224,21 @@ const AO_CURVE = [0.42, 0.62, 0.8, 1];
 
 export class MeshBuilder {
   constructor() {
-    this.pos = []; this.nor = []; this.col = []; this.ind = [];
+    this.cap = 4096; // vertices
+    this.pos = new Float32Array(this.cap * 3);
+    this.nor = new Float32Array(this.cap * 3);
+    this.col = new Float32Array(this.cap * 3);
+    this.ind = new Uint32Array(this.cap * 1.5);
+    this.nv = 0; this.ni = 0;
     this._c = { r: 0, g: 0, b: 0 };
   }
-  reset() { this.pos.length = this.nor.length = this.col.length = this.ind.length = 0; }
+  reset() { this.nv = 0; this.ni = 0; }
+  grow() {
+    this.cap *= 2;
+    const g = (a, n) => { const b = new a.constructor(n); b.set(a); return b; };
+    this.pos = g(this.pos, this.cap * 3); this.nor = g(this.nor, this.cap * 3);
+    this.col = g(this.col, this.cap * 3); this.ind = g(this.ind, this.cap * 1.5);
+  }
 
   // occ(x,y,z) -> true if that cell hides a face
   emit(x, y, z, mat, b, occ) {
@@ -219,14 +249,17 @@ export class MeshBuilder {
       q[0] = x + F.n[0]; q[1] = y + F.n[1]; q[2] = z + F.n[2];
       if (occ(q[0], q[1], q[2])) continue;
       voxelColor(x, y, z, mat, b, this._c, F.d !== 1 || F.s < 0);
-      const base = this.pos.length / 3;
+      if (this.nv + 4 > this.cap) this.grow();
+      const base = this.nv;
+      const P = this.pos, N = this.nor, C = this.col;
       for (let c = 0; c < 4; c++) {
         const cu = F.corners[c][0], cv = F.corners[c][1];
         const vx0 = p[0] + (F.d === 0 && F.s > 0 ? 1 : 0) + (F.u === 0 ? cu : 0) + (F.v === 0 ? cv : 0);
         const vx1 = p[1] + (F.d === 1 && F.s > 0 ? 1 : 0) + (F.u === 1 ? cu : 0) + (F.v === 1 ? cv : 0);
         const vx2 = p[2] + (F.d === 2 && F.s > 0 ? 1 : 0) + (F.u === 2 ? cu : 0) + (F.v === 2 ? cv : 0);
-        this.pos.push(vx0, vx1, vx2);
-        this.nor.push(F.n[0], F.n[1], F.n[2]);
+        const o = (base + c) * 3;
+        P[o] = vx0; P[o + 1] = vx1; P[o + 2] = vx2;
+        N[o] = F.n[0]; N[o + 1] = F.n[1]; N[o + 2] = F.n[2];
         a[0] = bq[0] = cq[0] = q[0]; a[1] = bq[1] = cq[1] = q[1]; a[2] = bq[2] = cq[2] = q[2];
         a[F.u] += cu ? 1 : -1;
         bq[F.v] += cv ? 1 : -1;
@@ -237,20 +270,24 @@ export class MeshBuilder {
         const lvl = s1 && s2 ? 0 : 3 - (s1 + s2 + cn);
         ao[c] = lvl;
         const k = AO_CURVE[lvl];
-        this.col.push(this._c.r * k, this._c.g * k, this._c.b * k);
+        C[o] = this._c.r * k; C[o + 1] = this._c.g * k; C[o + 2] = this._c.b * k;
       }
-      if (ao[0] + ao[2] >= ao[1] + ao[3]) this.ind.push(base, base + 1, base + 2, base, base + 2, base + 3);
-      else this.ind.push(base + 1, base + 2, base + 3, base + 1, base + 3, base);
+      this.nv += 4;
+      const I = this.ind, j = this.ni;
+      if (ao[0] + ao[2] >= ao[1] + ao[3]) { I[j] = base; I[j + 1] = base + 1; I[j + 2] = base + 2; I[j + 3] = base; I[j + 4] = base + 2; I[j + 5] = base + 3; }
+      else { I[j] = base + 1; I[j + 1] = base + 2; I[j + 2] = base + 3; I[j + 3] = base + 1; I[j + 4] = base + 3; I[j + 5] = base; }
+      this.ni += 6;
     }
   }
 
   toGeometry() {
-    if (!this.ind.length) return null;
+    if (!this.ni) return null;
     const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
-    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nor, 3));
-    g.setAttribute('color', new THREE.Float32BufferAttribute(this.col, 3));
-    g.setIndex(this.ind);
+    const n = this.nv * 3;
+    g.setAttribute('position', new THREE.BufferAttribute(this.pos.slice(0, n), 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(this.nor.slice(0, n), 3));
+    g.setAttribute('color', new THREE.BufferAttribute(this.col.slice(0, n), 3));
+    g.setIndex(new THREE.BufferAttribute(this.nv > 65535 ? this.ind.slice(0, this.ni) : Uint16Array.from(this.ind.subarray(0, this.ni)), 1));
     g.computeBoundingSphere();
     return g;
   }
@@ -265,6 +302,16 @@ export function worldOcc(x, y, z) {
   return c.grid[local(x, y, z)] !== 0;
 }
 
+// True if a section holds nothing but air (cheap check before meshing)
+export function sectionIsAir(key) {
+  const { cx, cy, cz } = decodeSection(key);
+  const col = getColumn(cx, cz);
+  if (!col) return true;
+  const g = col.grid, start = cy * CS * CS * CS, end = start + CS * CS * CS;
+  for (let i = start; i < end; i++) if (g[i]) return false;
+  return true;
+}
+
 const builder = new MeshBuilder();
 export function buildSectionGeometry(key) {
   const { cx, cy, cz } = decodeSection(key);
@@ -272,13 +319,28 @@ export function buildSectionGeometry(key) {
   if (!col) return null;
   builder.reset();
   const x0 = cx * CS, y0 = cy * CS, z0 = cz * CS;
-  for (let ly = 0; ly < CS; ly++)
+  const grid = col.grid, LAYER = CS * CS;
+  // Neighbour lookups inside this column read the grid directly
+  const occ = (x, y, z) => {
+    const lx = x - x0, lz = z - z0;
+    if (lx < 0 || lx >= CS || lz < 0 || lz >= CS) return worldOcc(x, y, z);
+    if (y < 0) return true;
+    if (y >= H) return false;
+    return grid[lx + CS * (lz + CS * y)] !== 0;
+  };
+  for (let ly = 0; ly < CS; ly++) {
+    const y = y0 + ly;
     for (let lz = 0; lz < CS; lz++)
       for (let lx = 0; lx < CS; lx++) {
-        const i = lx + CS * (lz + CS * (y0 + ly));
-        const m = col.grid[i];
-        if (m) builder.emit(x0 + lx, y0 + ly, z0 + lz, m, col.burn[i], worldOcc);
+        const i = lx + CS * (lz + CS * y);
+        const m = grid[i];
+        if (!m) continue;
+        // Fast path: a cell buried on all six sides inside this column has no faces
+        if (lx > 0 && lx < CS - 1 && lz > 0 && lz < CS - 1 && y > 0 && y < H - 1 &&
+          grid[i - 1] && grid[i + 1] && grid[i - CS] && grid[i + CS] && grid[i - LAYER] && grid[i + LAYER]) continue;
+        builder.emit(x0 + lx, y, z0 + lz, m, col.burn ? col.burn[i] : 0, occ);
       }
+  }
   return builder.toGeometry();
 }
 
@@ -390,7 +452,7 @@ function choosePlot(rx, rz) {
   if (rx === 0 && (rz === 0 || rz === 1)) base = Math.max(Math.round(baseHeight(24, 24)), WATER_LEVEL + 3);
   if (base <= WATER_LEVEL + 1) return null;
   if (type === 'city' && base > 26) type = 'village';
-  if (base > H - 22 && type !== 'watchtower') return null;
+  if (base > HM - 22 && type !== 'watchtower') return null;
   const flatten = type !== 'watchtower' && type !== 'ruins';
   return { type, x0: ox, z0: oz, x1: ox + size - 1, z1: oz + size - 1, base, flatten, seed: (rng() * 4294967296) | 0 };
 }
@@ -419,7 +481,8 @@ function plotsNear(x, z) {
   return out;
 }
 
-export function terrainHeight(x, z) {
+// Unrounded ground height in metres (tiny-block mode uses this for smooth slopes)
+export function terrainHeightF(x, z) {
   let h = baseHeight(x, z);
   let best = 0, target = h;
   for (const p of plotsNear(x, z)) {
@@ -428,7 +491,10 @@ export function terrainHeight(x, z) {
     if (w > best) { best = w; target = p.base; }
   }
   h += (target - h) * best;
-  return Math.max(2, Math.min(H - 6, Math.round(h)));
+  return Math.max(2, Math.min(HM - 6, h));
+}
+export function terrainHeight(x, z) {
+  return Math.round(terrainHeightF(x, z));
 }
 
 function insidePlot(x, z, pad) {
@@ -440,6 +506,10 @@ function insidePlot(x, z, pad) {
 // Column generation
 // ============================================================================
 function generateColumn(cx, cz) {
+  return VS === 1 ? generateColumn1(cx, cz) : generateColumnFine(cx, cz);
+}
+
+function generateColumn1(cx, cz) {
   const col = new Column(cx, cz);
   const g = col.grid;
   const X0 = cx * CS, Z0 = cz * CS;
@@ -528,17 +598,132 @@ function generateColumn(cx, cz) {
   return col;
 }
 
+// Tiny-block generation. Terrain is sampled per cell from the continuous height
+// field (smooth slopes), while structures and trees are still designed in metre
+// blocks and stamped as VS x VS x VS groups of cells.
+function generateColumnFine(cx, cz) {
+  const col = new Column(cx, cz);
+  const g = col.grid;
+  const X0 = cx * CS, Z0 = cz * CS;         // cells
+  const X1 = X0 + CS, Z1 = Z0 + CS;
+  const idx = (lx, y, lz) => lx + CS * (lz + CS * y);
+
+  // Writers in metre-block coordinates, clipped to this column
+  const S = (x, y, z, m) => {
+    if (y < 0 || y >= HM) return;
+    const ax = Math.max(x * VS, X0), bx = Math.min(x * VS + VS, X1);
+    if (ax >= bx) return;
+    const az = Math.max(z * VS, Z0), bz = Math.min(z * VS + VS, Z1);
+    if (az >= bz) return;
+    for (let yy = y * VS; yy < y * VS + VS; yy++)
+      for (let zz = az; zz < bz; zz++)
+        for (let xx = ax; xx < bx; xx++) g[idx(xx - X0, yy, zz - Z0)] = m;
+  };
+  const G = (x, y, z) => {
+    if (y < 0 || y >= HM) return 0;
+    const ax = Math.max(x * VS, X0), az = Math.max(z * VS, Z0);
+    if (ax >= Math.min(x * VS + VS, X1) || az >= Math.min(z * VS + VS, Z1)) return 0;
+    return g[idx(ax - X0, y * VS + (VS >> 1), az - Z0)];
+  };
+  const fill = (x0, x1, y0, y1, z0, z1, m) => {
+    const ax = Math.max(x0 * VS, X0), bx = Math.min((x1 + 1) * VS, X1);
+    const az = Math.max(z0 * VS, Z0), bz = Math.min((z1 + 1) * VS, Z1);
+    if (ax >= bx || az >= bz) return;
+    const ay = Math.max(0, y0 * VS), by = Math.min(H, (y1 + 1) * VS);
+    for (let y = ay; y < by; y++)
+      for (let z = az; z < bz; z++)
+        for (let x = ax; x < bx; x++) g[idx(x - X0, y, z - Z0)] = m;
+  };
+  const W = { S, G, fill };
+
+  // ---------------- Terrain ----------------
+  const biomes = new Map();
+  const biomeOf = (bx, bz) => {
+    const k = bx * 65536 + bz;
+    let b = biomes.get(k);
+    if (!b) { b = biomeAt(bx, bz); biomes.set(k, b); }
+    return b;
+  };
+  const topThick = Math.max(1, Math.round(VS * 0.2));
+  const waterTop = (WATER_LEVEL + 1) * VS; // first cell above the water
+  for (let lz = 0; lz < CS; lz++) {
+    for (let lx = 0; lx < CS; lx++) {
+      const xm = (X0 + lx + 0.5) / VS, zm = (Z0 + lz + 0.5) / VS;
+      const hf = terrainHeightF(xm, zm);
+      const yt = Math.max(VS, Math.min(H - 1, Math.round((hf + 1) * VS) - 1)); // top solid cell
+      const biome = biomeOf(Math.floor(xm), Math.floor(zm));
+      let top = M.GRASS, sub = M.DIRT;
+      if (hf >= 44) { top = M.SNOW; sub = M.STONE; }
+      else if (hf >= 36) { top = M.STONE; sub = M.STONE; }
+      else if (hf <= WATER_LEVEL + 1) { top = M.SAND; sub = M.SAND; }
+      else if (biome === 'desert') { top = M.SAND; sub = M.SAND; }
+      else if (biome === 'snow') { top = M.SNOW; sub = M.DIRT; }
+      for (let y = 0; y <= yt; y++) {
+        let m;
+        if (y < VS) m = M.BEDROCK;
+        else if (y > yt - topThick) m = top;
+        else if (y > yt - 4 * VS) m = sub;
+        else m = M.STONE;
+        g[idx(lx, y, lz)] = m;
+      }
+      for (let y = yt + 1; y < waterTop; y++) g[idx(lx, y, lz)] = M.WATER;
+      const bx = Math.floor(xm), bz = Math.floor(zm);
+      if (hf > WATER_LEVEL + 2 && hash3(bx, SEED + 99, bz) < 0.0009) {
+        for (let y = Math.max(VS, yt - 4 * VS); y < yt - VS; y++) g[idx(lx, y, lz)] = M.TNT;
+      }
+    }
+  }
+
+  // ---------------- Structures ----------------
+  const mx0 = Math.floor(X0 / VS), mx1 = Math.floor((X1 - 1) / VS);
+  const mz0 = Math.floor(Z0 / VS), mz1 = Math.floor((Z1 - 1) / VS);
+  const rx0 = Math.floor((mx0 - REGION) / REGION), rx1 = Math.floor((mx1 + REGION) / REGION);
+  const rz0 = Math.floor((mz0 - REGION) / REGION), rz1 = Math.floor((mz1 + REGION) / REGION);
+  for (let rz = rz0; rz <= rz1; rz++)
+    for (let rx = rx0; rx <= rx1; rx++) {
+      const p = getPlot(rx, rz);
+      if (!p) continue;
+      if (p.x1 + 3 < mx0 || p.x0 - 3 > mx1 || p.z1 + 3 < mz0 || p.z0 - 3 > mz1) continue;
+      BUILDERS[p.type](W, p, mulberry32(p.seed));
+    }
+
+  // ---------------- Trees ----------------
+  for (let z = mz0 - 3; z <= mz1 + 3; z++) {
+    for (let x = mx0 - 3; x <= mx1 + 3; x++) {
+      const r = hash3(x, SEED + 31, z);
+      if (r > 0.04) continue;
+      const biome = biomeAt(x, z);
+      const density = { forest: 0.035, autumn: 0.025, plains: 0.007, snow: 0.012, mountains: 0.006, desert: 0.003, lake: 0 }[biome];
+      if (r > density) continue;
+      const h = terrainHeight(x, z);
+      if (h <= WATER_LEVEL || h >= 42) continue;
+      if (insidePlot(x, z, 3)) continue;
+      const r2 = hash3(x, SEED + 57, z);
+      let kind;
+      if (biome === 'desert') kind = 'cactus';
+      else if (biome === 'snow' || biome === 'mountains') kind = 'pine';
+      else if (biome === 'autumn') kind = r2 < 0.5 ? 'autumn' : r2 < 0.8 ? 'birch' : 'oak';
+      else if (biome === 'forest') kind = r2 < 0.35 ? 'pine' : r2 < 0.55 ? 'birch' : 'oak';
+      else kind = r2 < 0.75 ? 'oak' : 'birch';
+      plantTree(W, x, h + 1, z, kind, r2);
+    }
+  }
+  return col;
+}
+
 function plantTree({ S, G, fill }, x, base, z, kind, r) {
   const rnd = mulberry32((r * 4294967296) | 0);
+  // With tiny blocks the ground is smooth, so sink trunks in to avoid floating trees
+  const root = VS > 1 ? base - 2 : base;
   if (kind === 'cactus') {
     const hgt = 2 + Math.floor(rnd() * 3);
-    fill(x, x, base, base + hgt, z, z, M.CACTUS);
+    fill(x, x, root, base + hgt, z, z, M.CACTUS);
     if (hgt > 2) { S(x + 1, base + 2, z, M.CACTUS); S(x + 1, base + 3, z, M.CACTUS); }
     return;
   }
   if (kind === 'pine') {
     const trunk = 6 + Math.floor(rnd() * 4);
-    fill(x, x, base, base + trunk - 1, z, z, M.WOOD);
+    fill(x, x, root, base + trunk - 1, z, z, M.WOOD);
     for (let i = 0; i < trunk + 1; i++) {
       const yy = base + 2 + i;
       const rad = Math.max(0, Math.round((trunk - i) * 0.4));
@@ -551,7 +736,7 @@ function plantTree({ S, G, fill }, x, base, z, kind, r) {
     return;
   }
   const trunk = 4 + Math.floor(rnd() * 3);
-  fill(x, x, base, base + trunk - 1, z, z, kind === 'birch' ? M.BIRCH : M.WOOD);
+  fill(x, x, root, base + trunk - 1, z, z, kind === 'birch' ? M.BIRCH : M.WOOD);
   const leaf = kind === 'autumn' ? M.AUTUMN : M.LEAVES;
   const cy = base + trunk;
   for (let dy = -2; dy <= 2; dy++)
@@ -645,7 +830,7 @@ const BUILDERS = {
           continue;
         }
         const tall = 12 + Math.floor(rng() * 32);
-        const top = Math.min(H - 4, g + tall);
+        const top = Math.min(HM - 4, g + tall);
         const wall = [M.CONCRETE, M.DARKCON, M.BRICK, M.CONCRETE][Math.floor(rng() * 4)];
         for (let y = g; y < top; y++) {
           const floor = (y - g) % 3 === 0;
@@ -662,7 +847,7 @@ const BUILDERS = {
             }
         }
         fill(x0, x0 + w - 1, top, top, z0, z0 + d - 1, wall);
-        if (rng() < 0.5) fill(x0 + 4, x0 + 4, top + 1, Math.min(H - 1, top + 2 + Math.floor(rng() * 4)), z0 + 4, z0 + 4, M.METAL);
+        if (rng() < 0.5) fill(x0 + 4, x0 + 4, top + 1, Math.min(HM - 1, top + 2 + Math.floor(rng() * 4)), z0 + 4, z0 + 4, M.METAL);
         if (rng() < 0.15) fill(x0 + 3, x0 + 5, g, g + 1, z0 + 3, z0 + 5, M.TNT); // basement explosives
       }
     }
@@ -774,7 +959,7 @@ const BUILDERS = {
         const x = horiz ? sx + i : sx, z = horiz ? sz : sz + i;
         const ground = terrainHeight(x, z);
         const colH = Math.max(1, Math.round(hgt * (0.4 + 0.6 * hash3(x, n, z))));
-        for (let y = ground + 1; y <= ground + colH; y++) S(x, y, z, hash3(x, y, z) < 0.3 ? M.MOSSY : M.COBBLE);
+        for (let y = ground + (VS > 1 ? 0 : 1); y <= ground + colH; y++) S(x, y, z, hash3(x, y, z) < 0.3 ? M.MOSSY : M.COBBLE);
       }
     }
     // Pillars
@@ -782,7 +967,7 @@ const BUILDERS = {
       const x = p.x0 + 2 + Math.floor(rng() * 18), z = p.z0 + 2 + Math.floor(rng() * 18);
       const ground = terrainHeight(x, z);
       const hgt = 4 + Math.floor(rng() * 8);
-      for (let y = ground + 1; y <= ground + hgt; y++) S(x, y, z, M.STONE);
+      for (let y = ground + (VS > 1 ? 0 : 1); y <= ground + hgt; y++) S(x, y, z, M.STONE);
     }
   },
 
@@ -798,6 +983,8 @@ const BUILDERS = {
 };
 
 export function spawnPoint() {
-  const x = 24, z = 58;
-  return { x: x + 0.5, y: terrainHeight(x, z) + 1, z: z + 0.5, yaw: 0 };
+  // Tiny mode can only see ~19 m, so start right in front of the castle gate
+  const x = 24, z = VS > 1 ? 46 : 58;
+  const y = VS === 1 ? terrainHeight(x, z) + 1 : Math.round((terrainHeightF(x + 0.5, z + 0.5) + 1) * VS) / VS;
+  return { x: x + 0.5, y, z: z + 0.5, yaw: 0 };
 }

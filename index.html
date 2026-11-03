@@ -126,6 +126,18 @@
       border: none; background: var(--accent); color: #1a1205; cursor: pointer;
     }
     #play:hover { filter: brightness(1.1); }
+    .setting {
+      display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap;
+      margin: 18px 0 0; font-size: 13px; color: var(--muted);
+    }
+    .seg { display: inline-flex; padding: 3px; gap: 3px; border-radius: 9px; background: rgba(255,255,255,0.08); }
+    .seg button {
+      font: inherit; font-size: 13px; font-weight: 600; padding: 5px 12px; border-radius: 7px; cursor: pointer;
+      border: none; background: transparent; color: var(--muted);
+    }
+    .seg button:hover { color: var(--text); }
+    .seg button.on { background: var(--accent); color: #1a1205; }
+    #block-note { margin: 8px 0 0; font-size: 12px; min-height: 1em; }
     .controls {
       display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 22px 0 0;
       text-align: left; font-size: 13px; color: var(--muted);
@@ -178,6 +190,14 @@
       <h1>VOXEL <span>DESTRUCTION</span></h1>
       <p>An endless procedurally generated world. Wreck castles, flatten cities, nuke pyramids.</p>
       <button id="play">Click to play</button>
+      <div class="setting">
+        <span>Block size</span>
+        <div class="seg" id="block-size">
+          <button data-scale="1">Normal (1 m)</button>
+          <button data-scale="10">Tiny (10 cm)</button>
+        </div>
+      </div>
+      <p id="block-note"></p>
       <div class="controls">
         <kbd>W A S D</kbd><span>Move (<kbd>Shift</kbd> to sprint)</span>
         <kbd>Mouse</kbd><span>Look around</span>
